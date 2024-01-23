@@ -32,15 +32,59 @@ fromByteList bytes =
 
 -- Convert a variable-width ByteList to or from a fixed-width Vector n (Bit 8),
 -- padding or truncating as needed.
-class ByteListToVector n where
-  byteListToVector :: ByteList -> Vector.Vector n (Bit 8)
+byteListToVector :: ByteList -> Vector.Vector n (Bit 8)
+byteListToVector bytes =
+  let diff = length bytes - valueOf n
+  in Vector.toVector $
+    if diff < 0 then bytes `append` replicate diff 0 else drop (negate diff) bytes
 
-instance ByteListToVector 0 where
-  byteListToVector _ = Vector.nil
+interface ByteStreamEncoder a =
+  put :: a -> Action
+  get :: ActionValue (Bit 8)
 
-instance (Add n1 1 n, ByteListToVector n1) => ByteListToVector n where
-  byteListToVector (Cons b bs) = b `Vector.cons` byteListToVector bs
-  byteListToVector Nil = Vector.replicate 0
+-- This could be a Contravariant instance, if Bluespec supported it
+contramapEncoder :: (a -> b) -> ByteStreamEncoder b -> ByteStreamEncoder a
+contramapEncoder f e =
+  interface ByteStreamEncoder
+    put x = e.put $ f x
+    get = e.get
+
+-- This could be a Divisible instance, if Bluespec supported it
+divideEncoder :: (a -> (b, c)) -> ByteStreamEncoder b -> ByteStreamEncoder c -> ByteStreamEncoder a
+divideEncoder f e1 e2 =
+  interface ByteStreamEncoder
+    put x = do
+      let (y, z) = f x
+      e1.put y
+      e2.put z
+    get = if impCondOf e1.get then e1.get else e2.get
+
+conquerEncoder :: ByteStreamEncoder a
+conquerEncoder =
+  interface ByteStreamEncoder
+    put _ = noAction
+    get = _when_ False $ return _
+
+interface ByteStreamDecoder a =
+  put :: Bit 8 -> Action
+  deq :: Action
+  value :: a
+
+instance Monad ByteStreamDecoder where
+  bind d1 f =
+    let d2 = f d1.value
+    in
+      interface ByteStreamDecoder
+        put = if impCondOf d1.put then d1.put else d2.put
+        deq = do
+          d1.deq
+          d2.deq
+        value = d2.value
+  return x =
+    interface ByteStreamDecoder
+      put _ = _when_ False noAction
+      deq = noAction
+      value = x
 
 -- Class of types that can be represented and automatically packed/unpacked in C.
 -- n is the maximum number of bytes needed to pack a type.
@@ -62,6 +106,8 @@ class GenCRepr a n | a -> n where
   -- Pack a value of type a into a ByteList of at most n bytes.
   packBytes :: a -> ByteList
 
+  mkEncoder :: Module (ByteStreamEncoder a)
+
   -- Compute the C statement to pack a value of type a,
   -- given C expressions for the value and the result buffer.
   genCPack :: a -> String -> String -> String
@@ -77,6 +123,8 @@ class GenCRepr a n | a -> n where
 
   -- Monadic version of unpackBytes using the State monad
   unpackBytesS :: State ByteList a
+
+  mkDecoder :: Module (ByteStreamDecoder a)
 
   -- Compute the C statement to unpack a value of type a,
   -- given C expressions for the value and the result buffer.
@@ -104,6 +152,38 @@ numCBytes numBytes =
   else if numBytes <= 4 then Just 4
   else if numBytes <= 8 then Just 8
   else Nothing
+
+mkPrimEncoder :: (Bits a b, Div b 8 n, Mul n 8 c, Add b p c) =>
+  Module (ByteStreamEncoder a)
+mkPrimEncoder = module
+  value :: Reg a <- mkReg _
+  i :: Reg (UInt (TLog (TAdd 1 n))) <- mkReg $ fromInteger (valueOf n) - 1
+  let done = i == fromInteger (valueOf n) - 1
+      bytes :: Vector.Vector n (Bit 8) = Prelude.unpack $ Prelude.pack value ++ 0
+
+  interface
+    put x = _when_ done do
+      i := 0
+      value := x
+
+    get = _when_ (not done) do
+      i := i + 1
+      return $ Vector.select bytes i
+
+mkPrimDecoder :: (Bits a b, Div b 8 n, Mul n 8 c, Add b p c) =>
+  Module (ByteStreamDecoder a)
+mkPrimDecoder = module
+  bytes :: Vector.Vector n (Reg (Bit 8)) <- Vector.replicateM $ mkReg 0
+  i :: Reg (UInt (TLog (TAdd 1 n))) <- mkReg 0
+  let ready = i == fromInteger (valueOf n) - 1
+      value = Prelude.unpack (split $ Prelude.pack $ Vector.map readReg bytes).fst
+
+  interface
+    put x = _when_ (not ready) do
+      i := i + 1
+      (Vector.select bytes i) := x
+    deq = _when_ ready $ i := 0
+    value = _when_ ready value
 
 genCIntType :: Bool -> Integer -> (String, String)
 genCIntType signed numBytes =
@@ -136,28 +216,32 @@ genCIntUnpack numBytes val buf =
      ) +++ " *" +++ buf +++ " += " +++ integerToString numBytes +++ ";"
 
 -- Explcit instances for specific primitive types
-instance (Div b 8 n) => GenCRepr (UInt b) n where
+instance (Div b 8 n, Add b p (TMul n 8)) => GenCRepr (UInt b) n where
   typeName _ = "uint" +++ integerToString (valueOf b)
 
   genCType _ = genCIntType False (valueOf n)
 
   packBytes x = toByteList $ Prelude.pack x
+  mkEncoder = mkPrimEncoder
   genCPack _ = genCIntPack (valueOf n)
 
   unpackBytesS = State $ \ x ->
     (Prelude.unpack $ fromByteList $ take (valueOf n) x, drop (valueOf n) x)
+  mkDecoder = mkPrimDecoder
   genCUnpack _ = genCIntUnpack (valueOf n)
 
-instance (Div b 8 n) => GenCRepr (Int b) n where
+instance (Div b 8 n, Add b p (TMul n 8)) => GenCRepr (Int b) n where
   typeName _ = "int" +++ integerToString (valueOf b)
 
   genCType _ = genCIntType True (valueOf n)
 
   packBytes x = toByteList $ Prelude.pack x
+  mkEncoder = mkPrimEncoder
   genCPack _ = genCIntPack (valueOf n)
 
   unpackBytesS = State $ \ x ->
     (Prelude.unpack $ fromByteList $ take (valueOf n) x, drop (valueOf n) x)
+  mkDecoder = mkPrimDecoder
   genCUnpack _ val buf =
     genCIntUnpack (valueOf n) val buf +++
     case numCBytes (valueOf n) of
@@ -174,9 +258,11 @@ instance GenCRepr Bool 1 where
   genCType _ = ("_Bool", "")
 
   packBytes x = zeroExtend (Prelude.pack x) :> Nil
+  mkEncoder = mkPrimEncoder
   genCPack _ = genCIntPack 1
 
   unpackBytesS = State $ \ x -> (Prelude.unpack $ truncate $ head x, tail x)
+  mkDecoder = mkPrimDecoder
   genCUnpack _ = genCIntUnpack 1
 
 -- Default instance uses generics for arbitrary data types
@@ -188,10 +274,12 @@ instance (Generic a r, GenCRepr' r n, GenCRepr a n1) => GenCRepr a n where
   genCTypeDecl _ = genCTypeDecl' (_ :: r)
 
   packBytes x = packBytes' $ from x
+  mkEncoder = liftM (contramapEncoder from) mkEncoder'
   genCPack _ = genCPack' (_ :: r)
   genCPackDecl _ = genCPackDecl' (_ :: r)
 
   unpackBytesS = liftM to unpackBytesS'
+  mkDecoder = liftM (fmap to) mkDecoder'
   genCUnpack _ = genCUnpack' (_ :: r)
   genCUnpackDecl _ = genCUnpackDecl' (_ :: r)
 
@@ -203,10 +291,12 @@ class GenCRepr' a n | a -> n where
   genCTypeDecl' :: a -> Maybe String
 
   packBytes' :: a -> ByteList
+  mkEncoder' :: Module (ByteStreamEncoder a)
   genCPack' :: a -> String -> String -> String
   genCPackDecl' :: a -> Maybe (String, String)
 
   unpackBytesS' :: State ByteList a
+  mkDecoder' :: Module (ByteStreamDecoder a)
   genCUnpack' :: a -> String -> String -> String
   genCUnpackDecl' :: a -> Maybe (String, String)
 
@@ -221,12 +311,14 @@ instance (Bits a numBits, Div numBits 8 n, Mul n 8 numBitsPadded,
   genCTypeDecl' _ = Nothing
 
   packBytes' (ConcPrim x) = toByteList $ ((Prelude.pack x ++ 0) :: Bit numBitsPadded)
+  mkEncoder' = liftM (contramapEncoder $ \ ConcPrim x -> x) mkPrimEncoder
   genCPack' _ = genCIntPack (valueOf n)
   genCPackDecl' _ = Nothing
 
   unpackBytesS' = State $ \ x ->
     (ConcPrim $ Prelude.unpack (split ((fromByteList $ take (valueOf n) x) :: Bit numBitsPadded)).fst,
      drop (valueOf n) x)
+  mkDecoder' = liftM (fmap ConcPrim) mkPrimDecoder
   genCUnpack' _ = genCIntUnpack (valueOf n)
   genCUnpackDecl' _ = Nothing
 
@@ -242,9 +334,9 @@ instance (GenCStructBody bodyRepr n, TypeNames ta) =>
     "enum { size_" +++ typeName' p +++ " = " +++ integerToString (valueOf n) +++ " };"
 
   packBytes' (Meta (Meta y)) = packStructBody y
+  mkEncoder' = liftM (contramapEncoder $ \ Meta (Meta x) -> x) mkStructEncoder
 
   genCPack' p val buf = "pack_" +++ typeName' p +++ "(" +++ val +++ ", " +++ buf +++ ");"
-
   genCPackDecl' p = Just (
     "void pack_" +++ typeName' p +++ "(" +++ typeName' p +++ " val, uint8_t **buf);",
     "void pack_" +++ typeName' p +++ "(" +++ typeName' p +++ " val, uint8_t **buf) {\n" +++
@@ -252,9 +344,9 @@ instance (GenCStructBody bodyRepr n, TypeNames ta) =>
     "}")
 
   unpackBytesS' = liftM Meta $ liftM Meta unpackStructBody
+  mkDecoder' = liftM (fmap $ Meta `compose` Meta) mkStructDecoder
 
   genCUnpack' p val buf = val +++ " = unpack_" +++ typeName' p +++ "(" +++ buf +++ ");"
-
   genCUnpackDecl' p = Just (
     typeName' p +++ " unpack_" +++ typeName' p +++ "(uint8_t **buf);",
     typeName' p +++ " unpack_" +++ typeName' p +++ "(uint8_t **buf) {\n" +++
@@ -275,9 +367,9 @@ instance (GenCStructBody bodyRepr n, TypeNames ta) =>
     "enum { size_" +++ typeName' p +++ " = " +++ integerToString (valueOf n) +++ " };"
 
   packBytes' (Meta (Meta y)) = packStructBody y
+  mkEncoder' = liftM (contramapEncoder $ \ Meta (Meta x) -> x) mkStructEncoder
 
   genCPack' p val buf = "pack_" +++ typeName' p +++ "(" +++ val +++ ", " +++ buf +++ ");"
-
   genCPackDecl' p = Just (
     "void pack_" +++ typeName' p +++ "(" +++ typeName' p +++ " val, uint8_t **buf);",
     "void pack_" +++ typeName' p +++ "(" +++ typeName' p +++ " val, uint8_t **buf) {\n" +++
@@ -285,9 +377,9 @@ instance (GenCStructBody bodyRepr n, TypeNames ta) =>
     "}")
 
   unpackBytesS' = liftM Meta $ liftM Meta unpackStructBody
+  mkDecoder' = liftM (fmap $ Meta `compose` Meta) mkStructDecoder
 
   genCUnpack' p val buf = val +++ " = unpack_" +++ typeName' p +++ "(" +++ buf +++ ");"
-
   genCUnpackDecl' p = Just (
     typeName' p +++ " unpack_" +++ typeName' p +++ "(uint8_t **buf);",
     typeName' p +++ " unpack_" +++ typeName' p +++ "(uint8_t **buf) {\n" +++
@@ -299,7 +391,8 @@ instance (GenCStructBody bodyRepr n, TypeNames ta) =>
 -- Multi-constructor case, generate a tagged union
 instance (GenCUnionBody tagBytes bodyRepr 0 bodyBytes, TypeNames ta,
           GenCRepr' (Meta (MetaData name pkg ta numCtors) bodyRepr) n1, -- TODO: Why is this context needed?
-          Log numCtors tagBits, Div tagBits 8 tagBytes, Add tagBytes bodyBytes n) =>
+          Log numCtors tagBits, Div tagBits 8 tagBytes, Add tagBytes bodyBytes n,
+          Add (TMul tagBytes 8) tagBitsPad (TMul (TDiv (TMul tagBytes 8) 8) 8)) =>
          GenCRepr' (Meta (MetaData name pkg ta numCtors) bodyRepr) n where
   typeName' _ = stringOf name +++ typeNames (_ :: ta)
 
@@ -317,9 +410,9 @@ instance (GenCUnionBody tagBytes bodyRepr 0 bodyBytes, TypeNames ta,
     "enum { size_" +++ typeName' p +++ " = " +++ integerToString (valueOf n) +++ " };"
 
   packBytes' (Meta y) = packUnionBody (_ :: Bit tagBytes) y
+  mkEncoder' = liftM (contramapEncoder $ \ Meta x -> x) $ mkUnionEncoder (_ :: Bit tagBytes)
 
   genCPack' p val buf = "pack_" +++ typeName' p +++ "(" +++ val +++ ", " +++ buf +++ ");"
-
   genCPackDecl' p = Just (
     "void pack_" +++ typeName' p +++ "(" +++ typeName' p +++ " val, uint8_t **buf);",
     "void pack_" +++ typeName' p +++ "(" +++ typeName' p +++ " val, uint8_t **buf) {\n" +++
@@ -328,9 +421,12 @@ instance (GenCUnionBody tagBytes bodyRepr 0 bodyBytes, TypeNames ta,
     "}")
 
   unpackBytesS' = liftM Meta $ unpackUnionBody (_ :: Bit tagBytes)
+  mkDecoder' = do
+    tag :: ByteStreamDecoder (UInt (TMul tagBytes 8)) <- mkPrimDecoder
+    body <- mkUnionDecoder tag.value
+    return $ liftM2 (\ _ x -> Meta x) tag body
 
   genCUnpack' p val buf = val +++ " = unpack_" +++ typeName' p +++ "(" +++ buf +++ ");"
-
   genCUnpackDecl' p = Just (
     typeName' p +++ " unpack_" +++ typeName' p +++ "(uint8_t **buf);",
     typeName' p +++ " unpack_" +++ typeName' p +++ "(uint8_t **buf) {\n" +++
@@ -341,7 +437,7 @@ instance (GenCUnionBody tagBytes bodyRepr 0 bodyBytes, TypeNames ta,
     "}")
 
 -- Collections (ListN and Vector) are represented as arrays
-instance (GenCRepr a elemBytes, Mul elemBytes numElems n) =>
+instance (GenCRepr a elemBytes, Mul elemBytes numElems n, Bits a nb) =>
          GenCRepr' (Meta (MetaData name pkg ta 1) (Vector.Vector numElems (Conc a))) n where
   typeName' _ = integerToString (valueOf numElems) +++ "_" +++ typeName (_ :: a) +++ "s"
 
@@ -351,6 +447,22 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n) =>
   genCTypeDecl' _ = Nothing
 
   packBytes' (Meta x) = Vector.foldr append Nil $ Vector.map (\ (Conc a) -> packBytes a) x
+  mkEncoder' = module
+    e :: ByteStreamEncoder a <- mkEncoder
+    value :: Reg (Vector.Vector numElems a) <- mkReg _
+    i :: Reg (UInt (TLog numElems)) <- mkReg $ fromInteger (valueOf numElems) - 1
+    let done = i == fromInteger (valueOf numElems) - 1
+
+    rules
+      "encode_item": when True ==> do
+        e.put $ Vector.select value i
+        i := i + 1
+
+    interface
+      put (Meta xs) = _when_ done do
+        value := Vector.map (\ (Conc x) -> x) xs
+        i := 0
+      get = e.get
 
   genCPack' _ val buf = Vector.foldr (\ p1 p2 -> p1 +++ " " +++ p2) "" $ Vector.map
     (\ i -> genCPack (_ :: a) (val +++ "[" +++ integerToString i +++ "]") buf)
@@ -365,6 +477,22 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n) =>
           res2 <- unpackElems (n - 1)
           return $ Conc res1 :> res2
     in liftM Meta $ liftM Vector.toVector $ unpackElems (valueOf numElems)
+  mkDecoder' = module
+    d :: ByteStreamDecoder a <- mkDecoder
+    items :: Vector.Vector numElems (Reg a) <- Vector.replicateM $ mkReg _
+    i :: Reg (UInt (TLog numElems)) <- mkReg 0
+    let ready = i == fromInteger (valueOf n) - 1
+
+    rules
+      "decode_item": when (not ready) ==> do
+        (Vector.select items i) := d.value
+        d.deq
+        i := i + 1
+
+    interface
+      put = d.put
+      deq = _when_ ready $ i := 0
+      value = _when_ ready $ Meta $ Vector.map (Conc `compose` readReg) items
 
   genCUnpack' _ val buf = Vector.foldr (\ p1 p2 -> p1 +++ " " +++ p2) "" $ Vector.map
     (\ i -> genCUnpack (_ :: a) (val +++ "[" +++ integerToString i +++ "]") buf)
@@ -409,9 +537,11 @@ class GenCUnionBody nt a i n | nt a -> i n where
   hasUnionMembers :: Bit nt -> a -> Bool
 
   packUnionBody :: Bit nt -> a -> ByteList
+  mkUnionEncoder :: Bit nt -> Module (ByteStreamEncoder a)
   genCPackUnionBody :: Bit nt -> a -> String -> String
 
   unpackUnionBody :: Bit nt -> State ByteList a
+  mkUnionDecoder :: UInt (TMul nt 8) -> Module (ByteStreamDecoder a)
   genCUnpackUnionBody :: Bit nt -> a -> String -> String
 
 -- "sum" case, need to compare the tag with the index in unpacking
@@ -431,6 +561,13 @@ instance (GenCUnionBody tagBytes a i1 n1, GenCUnionBody tagBytes b i2 n2,
 
   packUnionBody _ (Left x) = packUnionBody (_ :: Bit tagBytes) x
   packUnionBody _ (Right x) = packUnionBody (_ :: Bit tagBytes) x
+  mkUnionEncoder _ = module
+    e1 <- mkUnionEncoder (_ :: Bit tagBytes)
+    e2 <- mkUnionEncoder (_ :: Bit tagBytes)
+    interface
+      put (Left x) = e1.put x
+      put (Right x) = e2.put x
+      get = if impCondOf e1.get then e1.get else e2.get
   genCPackUnionBody _ _ typeName =
     genCPackUnionBody (_ :: Bit tagBytes) (_ :: a) typeName +++
     genCPackUnionBody (_ :: Bit tagBytes) (_ :: b) typeName
@@ -440,6 +577,15 @@ instance (GenCUnionBody tagBytes a i1 n1, GenCUnionBody tagBytes b i2 n2,
     if fromByteList (take (valueOf tagBytes) x) == ((fromInteger (valueOf i1)) :: Bit tagBits)
     then liftM Left $ unpackUnionBody (_ :: Bit tagBytes)
     else liftM Right $ unpackUnionBody (_ :: Bit tagBytes)
+  mkUnionDecoder tag = module
+    d1 <- mkUnionDecoder tag
+    d2 <- mkUnionDecoder tag
+    interface
+      put x = do
+        d1.put x
+        d2.put x
+      value = if impCondOf d1.value then Left d1.value else Right d2.value
+      deq = if impCondOf d1.deq then d1.deq else d2.deq
   genCUnpackUnionBody _ _ typeName =
     genCUnpackUnionBody (_ :: Bit tagBytes) (_ :: a) typeName +++
     genCUnpackUnionBody (_ :: Bit tagBytes) (_ :: b) typeName
@@ -453,16 +599,18 @@ instance (Mul tagBytes 8 tagBits) =>
 
   packUnionBody _ (Meta ()) =
     toByteList $ Prelude.pack ((fromInteger $ valueOf ctorIdx) :: UInt tagBits)
+  mkUnionEncoder _ = return conquerEncoder
   genCPackUnionBody _ _ _ = ""
 
   unpackUnionBody _ = do
     x <- get
     put $ drop (valueOf tagBytes) x
     return $ Meta ()
+  mkUnionDecoder _ = return $ return $ Meta ()
   genCUnpackUnionBody _ _ _ = ""
 
 -- Special case for a constructor with a single anonymous field, don't create an inner struct
-instance (GenCRepr a n, Mul tagBytes 8 tagBits) =>
+instance (GenCRepr a n, Mul tagBytes 8 tagBits, Add tagBits tagBitsPad (TMul (TDiv tagBits 8) 8)) =>
          GenCUnionBody tagBytes (Meta (MetaConsAnon ctorName ctorIdx 1) (Meta (MetaField fieldName fieldIdx) (Conc a))) ctorIdx n where
   genCEnumBody _ _ typeName = typeName +++ "_" +++ stringOf ctorName
   genCUnionBody _ _ _ =
@@ -472,6 +620,8 @@ instance (GenCRepr a n, Mul tagBytes 8 tagBits) =>
 
   packUnionBody _ (Meta (Meta (Conc x))) =
     append (toByteList $ Prelude.pack ((fromInteger $ valueOf ctorIdx) :: UInt tagBits)) $ packBytes x
+  mkUnionEncoder _ =
+    liftM2 (divideEncoder $ tuple2 $ (fromInteger $ valueOf ctorIdx) :: UInt tagBits) mkPrimEncoder mkEncoder
   genCPackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     "\t\t" +++ genCPack (_ :: a) ("val.contents." +++ stringOf ctorName) "buf" +++ "\n" +++
@@ -481,13 +631,19 @@ instance (GenCRepr a n, Mul tagBytes 8 tagBits) =>
     x <- get
     put $ drop (valueOf tagBytes) x
     liftM Meta $ liftM Meta $ liftM Conc unpackBytesS
+  mkUnionDecoder tag = module
+    d <- mkDecoder
+    interface
+      put x = if tag == fromInteger (valueOf ctorIdx) then d.put x else noAction
+      value = d.value
+      deq = d.deq
   genCUnpackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     "\t\t" +++ genCUnpack (_ :: a) ("val.contents." +++ stringOf ctorName) "buf" +++ "\n" +++
     "\t} else "
 
 -- Instance for multiple named fields, represented by an inner struct
-instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits) =>
+instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits, Add tagBits tagBitsPad (TMul (TDiv tagBits 8) 8)) =>
          GenCUnionBody tagBytes (Meta (MetaConsNamed ctorName ctorIdx numFields) bodyRepr) ctorIdx n where
   genCEnumBody _ _ typeName = typeName +++ "_" +++ stringOf ctorName
   genCUnionBody _ _ typeName =
@@ -498,6 +654,8 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits) =>
 
   packUnionBody _ (Meta x) =
     append (toByteList (Prelude.pack ((fromInteger $ valueOf ctorIdx) :: UInt tagBits))) $ packStructBody x
+  mkUnionEncoder _ =
+    liftM2 (divideEncoder $ \ Meta x -> ((fromInteger $ valueOf ctorIdx) :: UInt tagBits, x)) mkPrimEncoder mkStructEncoder
   genCPackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCPackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
@@ -507,13 +665,19 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits) =>
     x <- get
     put $ drop (valueOf tagBytes) x
     liftM Meta unpackStructBody
+  mkUnionDecoder tag = module
+    d <- mkStructDecoder
+    interface
+      put x = if tag == fromInteger (valueOf ctorIdx) then d.put x else noAction
+      value = Meta d.value
+      deq = d.deq
   genCUnpackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCUnpackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
     "\t}"
 
 -- Instance for multiple anonymous fields, same as above
-instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits) =>
+instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits, Add tagBits tagBitsPad (TMul (TDiv tagBits 8) 8)) =>
          GenCUnionBody tagBytes (Meta (MetaConsAnon ctorName ctorIdx numFields) bodyRepr) ctorIdx n where
   genCEnumBody _ _ typeName = typeName +++ "_" +++ stringOf ctorName
   genCUnionBody _ _ typeName =
@@ -524,6 +688,8 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits) =>
 
   packUnionBody _ (Meta x) =
     append (toByteList (Prelude.pack ((fromInteger $ valueOf ctorIdx) :: UInt tagBits))) $ packStructBody x
+  mkUnionEncoder _ =
+    liftM2 (divideEncoder $ \ Meta x -> ((fromInteger $ valueOf ctorIdx) :: UInt tagBits, x)) mkPrimEncoder mkStructEncoder
   genCPackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCPackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
@@ -533,6 +699,12 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits) =>
     x <- get
     put $ drop (valueOf tagBytes) x
     liftM Meta unpackStructBody
+  mkUnionDecoder tag = module
+    d <- mkStructDecoder
+    interface
+      put x = if tag == fromInteger (valueOf ctorIdx) then d.put x else noAction
+      value = Meta d.value
+      deq = d.deq
   genCUnpackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCUnpackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
@@ -544,9 +716,13 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits) =>
 -- Code generation methods require proxy values for nt and a.
 class GenCStructBody a n | a -> n where
   genCStructBody :: a -> Bool -> String
+
   packStructBody :: a -> ByteList
+  mkStructEncoder :: Module (ByteStreamEncoder a)
   genCPackStructBody :: a -> Bool -> String -> String
+
   unpackStructBody :: State ByteList a
+  mkStructDecoder :: Module (ByteStreamDecoder a)
   genCUnpackStructBody :: a -> Bool -> String -> String
 
 -- "product" case
@@ -556,10 +732,12 @@ instance (GenCStructBody a n1, GenCStructBody b n2, Add n1 n2 n) =>
     genCStructBody (_ :: a) nested +++ genCStructBody (_ :: b) nested
 
   packStructBody (x, y) = packStructBody x `append` packStructBody y
+  mkStructEncoder = liftM2 (divideEncoder id) mkStructEncoder mkStructEncoder
   genCPackStructBody _ nested sel =
     genCPackStructBody (_ :: a) nested sel +++ genCPackStructBody (_ :: b) nested sel
 
   unpackStructBody = liftM2 tuple2 unpackStructBody unpackStructBody
+  mkStructDecoder = liftM2 (liftM2 tuple2) mkStructDecoder mkStructDecoder
   genCUnpackStructBody _ nested sel =
     genCUnpackStructBody (_ :: a) nested sel +++ genCUnpackStructBody (_ :: b) nested sel
 
@@ -567,8 +745,10 @@ instance (GenCStructBody a n1, GenCStructBody b n2, Add n1 n2 n) =>
 instance GenCStructBody () 0 where
   genCStructBody _ _ = ""
   packStructBody () = Nil
+  mkStructEncoder = return $ conquerEncoder
   genCPackStructBody _ _ _ = ""
   unpackStructBody = return ()
+  mkStructDecoder = return $ return ()
   genCUnpackStructBody _ _ _ = ""
 
 -- Instance for a single concrete field, calls back to non-generic GenCRepr methods
@@ -578,11 +758,13 @@ instance (GenCRepr a n) => GenCStructBody (Meta (MetaField name idx) (Conc a)) n
     in (if nested then "\t\t" else "") +++ "\t" +++ lType +++ " " +++ stringOf name +++ rType +++ ";\n"
 
   packStructBody (Meta (Conc x)) = packBytes x
+  mkStructEncoder = liftM (contramapEncoder $ \ (Meta (Conc x)) -> x) mkEncoder
   genCPackStructBody _ nested sel =
     (if nested then "\t" else "") +++
     "\t" +++ genCPack (_ :: a) ("val" +++ sel +++ "." +++ stringOf name) "buf" +++ "\n"
 
   unpackStructBody = liftM Meta $ liftM Conc unpackBytesS
+  mkStructDecoder = liftM (fmap $ \ x -> (Meta (Conc x))) mkDecoder
   genCUnpackStructBody _ nested sel =
     (if nested then "\t" else "") +++
     "\t" +++ genCUnpack (_ :: a) ("val" +++ sel +++ "." +++ stringOf name) "buf" +++ "\n"
