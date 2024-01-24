@@ -40,6 +40,7 @@ byteListToVector bytes =
 
 interface ByteStreamEncoder a =
   put :: a -> Action
+  hasNext :: Bool
   get :: ActionValue (Bit 8)
 
 -- This could be a Contravariant instance, if Bluespec supported it
@@ -47,6 +48,7 @@ contramapEncoder :: (a -> b) -> ByteStreamEncoder b -> ByteStreamEncoder a
 contramapEncoder f e =
   interface ByteStreamEncoder
     put x = e.put $ f x
+    hasNext = e.hasNext
     get = e.get
 
 -- This could be a Divisible instance, if Bluespec supported it
@@ -57,16 +59,20 @@ divideEncoder f e1 e2 =
       let (y, z) = f x
       e1.put y
       e2.put z
-    get = if impCondOf e1.get then e1.get else e2.get
+    hasNext = e1.hasNext || e2.hasNext
+    get = if e1.hasNext then e1.get else e2.get
 
 conquerEncoder :: ByteStreamEncoder a
 conquerEncoder =
   interface ByteStreamEncoder
     put _ = noAction
+    hasNext = False
     get = _when_ False $ return _
 
 interface ByteStreamDecoder a =
+  notFull :: Bool
   put :: Bit 8 -> Action
+  hasValue :: Bool
   deq :: Action
   value :: a
 
@@ -75,14 +81,18 @@ instance Monad ByteStreamDecoder where
     let d2 = f d1.value
     in
       interface ByteStreamDecoder
-        put = if impCondOf d1.put then d1.put else d2.put
+        notFull = d1.notFull || d2.notFull
+        put = if d1.notFull then d1.put else d2.put
+        hasValue = d1.hasValue && d2.hasValue
         deq = do
           d1.deq
           d2.deq
         value = d2.value
   return x =
     interface ByteStreamDecoder
+      notFull = False
       put _ = _when_ False noAction
+      hasValue = True
       deq = noAction
       value = x
 
@@ -166,6 +176,7 @@ mkPrimEncoder = module
       i := 0
       value := x
 
+    hasNext = not done
     get = _when_ (not done) do
       i := i + 1
       return $ Vector.select bytes i
@@ -175,13 +186,15 @@ mkPrimDecoder :: (Bits a b, Div b 8 n, Mul n 8 c, Add b p c) =>
 mkPrimDecoder = module
   bytes :: Vector.Vector n (Reg (Bit 8)) <- Vector.replicateM $ mkReg 0
   i :: Reg (UInt (TLog (TAdd 1 n))) <- mkReg 0
-  let ready = i == fromInteger (valueOf n) - 1
+  let ready = i == fromInteger (valueOf n)
       value = Prelude.unpack (split $ Prelude.pack $ Vector.map readReg bytes).fst
 
   interface
+    notFull = not ready
     put x = _when_ (not ready) do
       i := i + 1
       (Vector.select bytes i) := x
+    hasValue = ready
     deq = _when_ ready $ i := 0
     value = _when_ ready value
 
@@ -423,7 +436,7 @@ instance (GenCUnionBody tagBytes bodyRepr 0 bodyBytes, TypeNames ta,
   unpackBytesS' = liftM Meta $ unpackUnionBody (_ :: Bit tagBytes)
   mkDecoder' = do
     tag :: ByteStreamDecoder (UInt (TMul tagBytes 8)) <- mkPrimDecoder
-    body <- mkUnionDecoder tag.value
+    body :: ByteStreamDecoder bodyRepr <- mkUnionDecoder tag.value
     return $ liftM2 (\ _ x -> Meta x) tag body
 
   genCUnpack' p val buf = val +++ " = unpack_" +++ typeName' p +++ "(" +++ buf +++ ");"
@@ -462,6 +475,7 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n, Bits a nb) =>
       put (Meta xs) = _when_ done do
         value := Vector.map (\ (Conc x) -> x) xs
         i := 0
+      hasNext = e.hasNext
       get = e.get
 
   genCPack' _ val buf = Vector.foldr (\ p1 p2 -> p1 +++ " " +++ p2) "" $ Vector.map
@@ -481,7 +495,7 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n, Bits a nb) =>
     d :: ByteStreamDecoder a <- mkDecoder
     items :: Vector.Vector numElems (Reg a) <- Vector.replicateM $ mkReg _
     i :: Reg (UInt (TLog numElems)) <- mkReg 0
-    let ready = i == fromInteger (valueOf n) - 1
+    let ready = i == fromInteger (valueOf n)
 
     rules
       "decode_item": when (not ready) ==> do
@@ -490,7 +504,9 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n, Bits a nb) =>
         i := i + 1
 
     interface
+      notFull = not ready
       put = d.put
+      hasValue = ready
       deq = _when_ ready $ i := 0
       value = _when_ ready $ Meta $ Vector.map (Conc `compose` readReg) items
 
@@ -562,12 +578,13 @@ instance (GenCUnionBody tagBytes a i1 n1, GenCUnionBody tagBytes b i2 n2,
   packUnionBody _ (Left x) = packUnionBody (_ :: Bit tagBytes) x
   packUnionBody _ (Right x) = packUnionBody (_ :: Bit tagBytes) x
   mkUnionEncoder _ = module
-    e1 <- mkUnionEncoder (_ :: Bit tagBytes)
-    e2 <- mkUnionEncoder (_ :: Bit tagBytes)
+    e1 :: ByteStreamEncoder a <- mkUnionEncoder (_ :: Bit tagBytes)
+    e2 :: ByteStreamEncoder b <- mkUnionEncoder (_ :: Bit tagBytes)
     interface
       put (Left x) = e1.put x
       put (Right x) = e2.put x
-      get = if impCondOf e1.get then e1.get else e2.get
+      hasNext = e1.hasNext || e2.hasNext
+      get = if e1.hasNext then e1.get else e2.get
   genCPackUnionBody _ _ typeName =
     genCPackUnionBody (_ :: Bit tagBytes) (_ :: a) typeName +++
     genCPackUnionBody (_ :: Bit tagBytes) (_ :: b) typeName
@@ -578,14 +595,16 @@ instance (GenCUnionBody tagBytes a i1 n1, GenCUnionBody tagBytes b i2 n2,
     then liftM Left $ unpackUnionBody (_ :: Bit tagBytes)
     else liftM Right $ unpackUnionBody (_ :: Bit tagBytes)
   mkUnionDecoder tag = module
-    d1 <- mkUnionDecoder tag
-    d2 <- mkUnionDecoder tag
+    d1 :: ByteStreamDecoder a <- mkUnionDecoder tag
+    d2 :: ByteStreamDecoder b <- mkUnionDecoder tag
     interface
+      notFull = d1.notFull && d2.notFull
       put x = do
         d1.put x
         d2.put x
-      value = if impCondOf d1.value then Left d1.value else Right d2.value
-      deq = if impCondOf d1.deq then d1.deq else d2.deq
+      hasValue = d1.hasValue || d2.hasValue
+      value = if d1.hasValue then Left d1.value else Right d2.value
+      deq = if d1.hasValue then d1.deq else d2.deq
   genCUnpackUnionBody _ _ typeName =
     genCUnpackUnionBody (_ :: Bit tagBytes) (_ :: a) typeName +++
     genCUnpackUnionBody (_ :: Bit tagBytes) (_ :: b) typeName
@@ -606,7 +625,14 @@ instance (Mul tagBytes 8 tagBits) =>
     x <- get
     put $ drop (valueOf tagBytes) x
     return $ Meta ()
-  mkUnionDecoder _ = return $ return $ Meta ()
+  mkUnionDecoder tag = module
+    let matchesTag = tag == fromInteger (valueOf ctorIdx)
+    interface
+      notFull = not matchesTag
+      put _ = _when_ (not matchesTag) noAction
+      hasValue = matchesTag
+      value = _when_ matchesTag $ Meta ()
+      deq = _when_ matchesTag noAction
   genCUnpackUnionBody _ _ _ = ""
 
 -- Special case for a constructor with a single anonymous field, don't create an inner struct
@@ -632,11 +658,14 @@ instance (GenCRepr a n, Mul tagBytes 8 tagBits, Add tagBits tagBitsPad (TMul (TD
     put $ drop (valueOf tagBytes) x
     liftM Meta $ liftM Meta $ liftM Conc unpackBytesS
   mkUnionDecoder tag = module
-    d <- mkDecoder
+    d :: ByteStreamDecoder a <- mkDecoder
+    let matchesTag = tag == fromInteger (valueOf ctorIdx)
     interface
-      put x = if tag == fromInteger (valueOf ctorIdx) then d.put x else noAction
-      value = d.value
-      deq = d.deq
+      notFull = not matchesTag || d.notFull
+      put x = if matchesTag then d.put x else noAction
+      hasValue = matchesTag && d.hasValue
+      value = _when_ matchesTag $ Meta $ Meta $ Conc d.value
+      deq = _when_ matchesTag d.deq
   genCUnpackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     "\t\t" +++ genCUnpack (_ :: a) ("val.contents." +++ stringOf ctorName) "buf" +++ "\n" +++
@@ -666,11 +695,14 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits, Add tagBits tagBits
     put $ drop (valueOf tagBytes) x
     liftM Meta unpackStructBody
   mkUnionDecoder tag = module
-    d <- mkStructDecoder
+    d :: ByteStreamDecoder bodyRepr <- mkStructDecoder
+    let matchesTag = tag == fromInteger (valueOf ctorIdx)
     interface
-      put x = if tag == fromInteger (valueOf ctorIdx) then d.put x else noAction
-      value = Meta d.value
-      deq = d.deq
+      notFull = not matchesTag || d.notFull
+      put x = if matchesTag then d.put x else noAction
+      hasValue = matchesTag && d.hasValue
+      value = _when_ matchesTag $ Meta d.value
+      deq = _when_ matchesTag d.deq
   genCUnpackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCUnpackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
@@ -700,11 +732,14 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits, Add tagBits tagBits
     put $ drop (valueOf tagBytes) x
     liftM Meta unpackStructBody
   mkUnionDecoder tag = module
-    d <- mkStructDecoder
+    d :: ByteStreamDecoder bodyRepr <- mkStructDecoder
+    let matchesTag = tag == fromInteger (valueOf ctorIdx)
     interface
-      put x = if tag == fromInteger (valueOf ctorIdx) then d.put x else noAction
-      value = Meta d.value
-      deq = d.deq
+      notFull = not matchesTag || d.notFull
+      put x = if matchesTag then d.put x else noAction
+      hasValue = matchesTag && d.hasValue
+      value = _when_ matchesTag $ Meta d.value
+      deq = _when_ matchesTag d.deq
   genCUnpackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCUnpackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
