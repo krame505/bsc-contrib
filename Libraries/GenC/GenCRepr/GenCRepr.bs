@@ -38,9 +38,10 @@ byteListToVector bytes =
   in Vector.toVector $
     if diff < 0 then bytes `append` replicate diff 0 else drop (negate diff) bytes
 
+-- IMPORTANT NOTE: using this requires aggressive_implicit_conditions.
 interface ByteStreamEncoder a =
   put :: a -> Action
-  hasNext :: Bool
+  notDone :: Bool
   get :: ActionValue (Bit 8)
 
 -- This could be a Contravariant instance, if Bluespec supported it
@@ -48,7 +49,7 @@ contramapEncoder :: (a -> b) -> ByteStreamEncoder b -> ByteStreamEncoder a
 contramapEncoder f e =
   interface ByteStreamEncoder
     put x = e.put $ f x
-    hasNext = e.hasNext
+    notDone = e.notDone
     get = e.get
 
 -- This could be a Divisible instance, if Bluespec supported it
@@ -59,16 +60,17 @@ divideEncoder f e1 e2 =
       let (y, z) = f x
       e1.put y
       e2.put z
-    hasNext = e1.hasNext || e2.hasNext
-    get = if e1.hasNext then e1.get else e2.get
+    notDone = e1.notDone || e2.notDone
+    get = splitDeepAV $ if e1.notDone then nosplitDeepAV e1.get else nosplitDeepAV e2.get
 
 conquerEncoder :: ByteStreamEncoder a
 conquerEncoder =
   interface ByteStreamEncoder
     put _ = noAction
-    hasNext = False
+    notDone = False
     get = _when_ False $ return _
 
+-- IMPORTANT NOTE: using this requires aggressive_implicit_conditions.
 interface ByteStreamDecoder a =
   notFull :: Bool
   put :: Bit 8 -> Action
@@ -167,16 +169,17 @@ mkPrimEncoder :: (Bits a b, Div b 8 n, Mul n 8 c, Add b p c) =>
   Module (ByteStreamEncoder a)
 mkPrimEncoder = module
   value :: Reg a <- mkReg _
-  i :: Reg (UInt (TLog (TAdd 1 n))) <- mkReg $ fromInteger (valueOf n) - 1
-  let done = i == fromInteger (valueOf n) - 1
-      bytes :: Vector.Vector n (Bit 8) = Prelude.unpack $ Prelude.pack value ++ 0
+  i :: Reg (UInt (TLog (TAdd 1 n))) <- mkReg $ fromInteger (valueOf n)
+  let done = i == fromInteger (valueOf n)
+      bytes :: Vector.Vector n (Bit 8) =
+        Vector.toVector $ toByteList $ Prelude.pack value
 
   interface
     put x = _when_ done do
       i := 0
       value := x
 
-    hasNext = not done
+    notDone = not done
     get = _when_ (not done) do
       i := i + 1
       return $ Vector.select bytes i
@@ -187,7 +190,7 @@ mkPrimDecoder = module
   bytes :: Vector.Vector n (Reg (Bit 8)) <- Vector.replicateM $ mkReg 0
   i :: Reg (UInt (TLog (TAdd 1 n))) <- mkReg 0
   let ready = i == fromInteger (valueOf n)
-      value = Prelude.unpack (split $ Prelude.pack $ Vector.map readReg bytes).fst
+      value = Prelude.unpack $ fromByteList $ Vector.toList $ Vector.map readReg bytes
 
   interface
     notFull = not ready
@@ -463,11 +466,11 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n, Bits a nb) =>
   mkEncoder' = module
     e :: ByteStreamEncoder a <- mkEncoder
     value :: Reg (Vector.Vector numElems a) <- mkReg _
-    i :: Reg (UInt (TLog numElems)) <- mkReg $ fromInteger (valueOf numElems) - 1
-    let done = i == fromInteger (valueOf numElems) - 1
+    i :: Reg (UInt (TLog (TAdd 1 numElems))) <- mkReg $ fromInteger (valueOf numElems)
+    let done = i == fromInteger (valueOf numElems) && not e.notDone
 
     rules
-      "encode_item": when True ==> do
+      "encode_item": when i < fromInteger (valueOf numElems) ==> do
         e.put $ Vector.select value i
         i := i + 1
 
@@ -475,7 +478,7 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n, Bits a nb) =>
       put (Meta xs) = _when_ done do
         value := Vector.map (\ (Conc x) -> x) xs
         i := 0
-      hasNext = e.hasNext
+      notDone = not done
       get = e.get
 
   genCPack' _ val buf = Vector.foldr (\ p1 p2 -> p1 +++ " " +++ p2) "" $ Vector.map
@@ -494,11 +497,11 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n, Bits a nb) =>
   mkDecoder' = module
     d :: ByteStreamDecoder a <- mkDecoder
     items :: Vector.Vector numElems (Reg a) <- Vector.replicateM $ mkReg _
-    i :: Reg (UInt (TLog numElems)) <- mkReg 0
+    i :: Reg (UInt (TLog (TAdd 1 numElems))) <- mkReg 0
     let ready = i == fromInteger (valueOf n)
 
     rules
-      "decode_item": when (not ready) ==> do
+      "decode_item": when not ready ==> do
         (Vector.select items i) := d.value
         d.deq
         i := i + 1
@@ -580,11 +583,12 @@ instance (GenCUnionBody tagBytes a i1 n1, GenCUnionBody tagBytes b i2 n2,
   mkUnionEncoder _ = module
     e1 :: ByteStreamEncoder a <- mkUnionEncoder (_ :: Bit tagBytes)
     e2 :: ByteStreamEncoder b <- mkUnionEncoder (_ :: Bit tagBytes)
+    let notDone = e1.notDone || e2.notDone
     interface
-      put (Left x) = e1.put x
-      put (Right x) = e2.put x
-      hasNext = e1.hasNext || e2.hasNext
-      get = if e1.hasNext then e1.get else e2.get
+      put (Left x) = _when_ (not notDone) $ e1.put x
+      put (Right x) = _when_ (not notDone) $ e2.put x
+      notDone = e1.notDone || e2.notDone
+      get = if e1.notDone then e1.get else e2.get
   genCPackUnionBody _ _ typeName =
     genCPackUnionBody (_ :: Bit tagBytes) (_ :: a) typeName +++
     genCPackUnionBody (_ :: Bit tagBytes) (_ :: b) typeName
@@ -610,7 +614,7 @@ instance (GenCUnionBody tagBytes a i1 n1, GenCUnionBody tagBytes b i2 n2,
     genCUnpackUnionBody (_ :: Bit tagBytes) (_ :: b) typeName
 
 -- Special case for a constructor with no members, don't create a struct
-instance (Mul tagBytes 8 tagBits) =>
+instance (Mul tagBytes 8 tagBits, Add tagBits tagBitsPad (TMul (TDiv tagBits 8) 8)) =>
          GenCUnionBody tagBytes (Meta (MetaConsAnon ctorName ctorIdx 0) ()) ctorIdx 0 where
   genCEnumBody _ _ typeName = typeName +++ "_" +++ stringOf ctorName
   genCUnionBody _ _ _ = ""
@@ -618,7 +622,8 @@ instance (Mul tagBytes 8 tagBits) =>
 
   packUnionBody _ (Meta ()) =
     toByteList $ Prelude.pack ((fromInteger $ valueOf ctorIdx) :: UInt tagBits)
-  mkUnionEncoder _ = return conquerEncoder
+  mkUnionEncoder _ =
+    fmap (contramapEncoder $ \ Meta () -> (fromInteger $ valueOf ctorIdx) :: UInt tagBits) mkPrimEncoder
   genCPackUnionBody _ _ _ = ""
 
   unpackUnionBody _ = do
@@ -688,7 +693,7 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits, Add tagBits tagBits
   genCPackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCPackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
-    "\t}"
+    "\t} else "
 
   unpackUnionBody _ = do
     x <- get
@@ -706,7 +711,7 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits, Add tagBits tagBits
   genCUnpackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCUnpackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
-    "\t}"
+    "\t} else "
 
 -- Instance for multiple anonymous fields, same as above
 instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits, Add tagBits tagBitsPad (TMul (TDiv tagBits 8) 8)) =>
@@ -725,7 +730,7 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits, Add tagBits tagBits
   genCPackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCPackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
-    "\t}"
+    "\t} else "
 
   unpackUnionBody _ = do
     x <- get
@@ -743,7 +748,7 @@ instance (GenCStructBody bodyRepr n, Mul tagBytes 8 tagBits, Add tagBits tagBits
   genCUnpackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCUnpackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
-    "\t}"
+    "\t} else "
 
 -- Helper type class to handle product types.
 -- a = representation type of contents

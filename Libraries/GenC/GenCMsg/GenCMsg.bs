@@ -77,51 +77,70 @@ instance (FIFOs fifos rxBytes rxCount txBytes txCount,
           Add txCount tagBytes rxHead, Add rxHead rxBytes rxTotalBytes,
           Add txCount rxRest rxTotalBytes,
           Add rxCount tagBytes txHead, Add txHead txBytes txTotalBytes,
+          Add txIndexPad (TLog (TAdd 1 txBytes)) (TLog (TAdd 1 txTotalBytes)),  -- for zeroExtend txIndex
+          Add tagBitsPad tagBits (TMul tagBytes 8),  -- for zeroExtend txTag
           Generic fifos (Meta (MetaData name pkg ta 1) r)) =>
          GenCMsg fifos rxTotalBytes txTotalBytes where
   mkMsgManager = module
-    rxMsgs :: FIFOF (Vector rxTotalBytes (Bit 8))
-    rxMsgs <- mkFIFOF
+    rxMsgs :: FIFOF (Vector rxTotalBytes (Bit 8)) <- mkFIFOF
+    rxCredits :: Vector rxCount (Reg (UInt 8)) <- mkRxCredits (_ :: fifos)
+    rxIndex :: Reg (UInt (TLog (TAdd 1 rxBytes))) <- mkReg 0
 
-    rxCredits :: Vector rxCount (Reg (UInt 8))
-    rxCredits <- mkRxCredits (_ :: fifos)
+    txMsgs :: FIFOF (SizedVector txTotalBytes (Bit 8)) <- mkFIFOF
+    txCredits :: Vector txCount (Reg (UInt 8)) <- mkTxCredits (_ :: fifos)
+    txTag :: Reg (UInt tagBits) <- mkReg 0
+    txEncodeBuffer :: Vector txBytes (Reg (Bit 8)) <- replicateM $ mkReg _
+    txIndex :: Reg (UInt (TLog (TAdd 1 txBytes))) <- mkReg 0
 
-    txMsgs :: FIFOF (SizedVector txTotalBytes (Bit 8))
-    txMsgs <- mkFIFOF
-
-    txCredits :: Vector txCount (Reg (UInt 8))
-    txCredits <- mkTxCredits (_ :: fifos)
-
-    let rxTagEq :: Integer -> Bool
-        rxTagEq i =
-          let packedTag :: Vector tagBytes (Bit 8)
-              packedTag = drop ((take rxMsgs.first) :: Vector rxHead (Bit 8))
-          in fromInteger i == fromByteVector packedTag
-    let rxBody :: ByteList
-        rxBody = toList ((takeTail rxMsgs.first) :: Vector rxBytes (Bit 8))
-    let deq :: Action
-        deq = do
+    let packedRxTag :: Vector tagBytes (Bit 8) =
+          drop ((take rxMsgs.first) :: Vector rxHead (Bit 8))
+        rxTagEq :: Integer -> Bool
+        rxTagEq i = fromInteger i == fromByteVector packedRxTag
+        rxBody :: Vector rxBytes (Bit 8) = takeTail rxMsgs.first
+        getByte :: ActionValue (Bit 8) = do
+          $display "getByte " (select rxBody rxIndex)
+          rxIndex := rxIndex + 1
+          return $ select rxBody rxIndex
+        deq :: Action = do
+          $display "deq"
           zipWithM_ (\ cr c -> writeReg cr (cr + Prelude.unpack c)) txCredits (take rxMsgs.first)
+          rxIndex := 0
           rxMsgs.deq
-    let enq :: Integer -> ByteList -> Action
-        enq txTag txBody = do
+
+        setTag :: Integer -> Action
+        setTag tag = _when_ (txTag == 0) do
+          $display "setTag " tag
+          txTag := fromInteger tag
+          txIndex := 0
+        putByte :: Integer -> Bit 8 -> Action
+        putByte tag x = _when_ (txTag == fromInteger tag) do
+          $display "putByte " tag " " x
+          txIndex := txIndex + 1
+          select txEncodeBuffer txIndex := x
+        enq :: Integer -> Action
+        enq tag = _when_ (txTag == fromInteger tag) do
+          $display "enq " tag " " txIndex
           mapM_ (flip writeReg 0) rxCredits
-          let packedCredits :: Vector rxCount (Bit 8)
-              packedCredits = map (\ c -> Prelude.pack (c :: Reg (UInt 8))) rxCredits
-          let packedTag :: Vector tagBytes (Bit 8)
-              packedTag = toByteVector $ fromInteger txTag
-          let packedBody :: Vector txBytes (Bit 8)
-              packedBody = byteListToVector txBody
+          txTag := 0
+          let packedCredits :: Vector rxCount (Bit 8) =
+                map (\ c -> Prelude.pack (c :: Reg (UInt 8))) rxCredits
+              packedTag :: Vector tagBytes (Bit 8) = toByteVector $ Prelude.pack $ zeroExtend txTag
+              packedBody :: Vector txBytes (Bit 8) = map readReg txEncodeBuffer
           txMsgs.enq
-            (fromInteger $ valueOf txHead + List.length txBody,
+            (fromInteger (valueOf txHead) + zeroExtend txIndex,
              packedCredits `append` packedTag `append` packedBody)
-    (fifos, rs) :: (fifos, Rules) <- mkFIFOs rxCredits rxTagEq rxBody deq txCredits enq
+
+    (fifos, rs) :: (fifos, Rules) <- mkFIFOs rxCredits rxTagEq getByte deq txCredits setTag putByte enq
 
     let handleCreditsOnly =
           rules
-             "handle_rx_credits_only": when any (\ c -> readReg c > 0) rxCredits ==> enq 0 List.nil
-             "handle_tx_credits_only": when rxTagEq 0 ==> deq
-    addRules $ rs <+ handleCreditsOnly
+             "handle_tx_credits_only": when any (\ c -> readReg c > 0) rxCredits ==> do
+                $display "handle_tx_credits_only"
+                enq 0
+             "handle_rx_credits_only": when rxTagEq 0 ==> do
+                $display "handle_rx_credits_only"
+                deq
+    addRules $ rs `rJoinDescendingUrgency` handleCreditsOnly
 
     interface
       fifos = fifos
@@ -184,8 +203,8 @@ instance (FIFOs fifos rxBytes rxCount txBytes txCount,
 class FIFOs fifos rxBytes rxCount txBytes txCount | fifos -> rxBytes rxCount txBytes txCount where
   mkRxCredits :: fifos -> Module (Vector rxCount (Reg (UInt 8)))
   mkTxCredits :: fifos -> Module (Vector txCount (Reg (UInt 8)))
-  mkFIFOs :: Vector rxCount (Reg (UInt 8)) -> (Integer -> Bool) -> ByteList -> Action ->
-             Vector txCount (Reg (UInt 8)) -> (Integer -> ByteList -> Action) ->
+  mkFIFOs :: Vector rxCount (Reg (UInt 8)) -> (Integer -> Bool) -> ActionValue (Bit 8) -> Action ->
+             Vector txCount (Reg (UInt 8)) -> (Integer -> Action) -> (Integer -> Bit 8 -> Action) -> (Integer -> Action) ->
              Module (fifos, Rules)
 
   genCMsgTypeHeaderDcls :: fifos -> State (List String) String
@@ -202,8 +221,8 @@ class FIFOs fifos rxBytes rxCount txBytes txCount | fifos -> rxBytes rxCount txB
 instance (Generic a r, FIFOs' r brx nrx btx ntx) => FIFOs a brx nrx btx ntx where
   mkRxCredits _ = mkRxCredits' (_ :: r)
   mkTxCredits _ = mkTxCredits' (_ :: r)
-  mkFIFOs rxCredits rxTagEq rxBody deq txCredits enq = do
-    (fifos, rs) <- mkFIFOs' rxCredits rxTagEq rxBody deq txCredits enq
+  mkFIFOs rxCredits rxTagEq getByte deq txCredits setTag putByte enq = do
+    (fifos, rs) <- mkFIFOs' rxCredits rxTagEq getByte deq txCredits setTag putByte enq
     return (to fifos, rs)
 
   genCMsgTypeHeaderDcls _ = genCMsgTypeHeaderDcls' (_ :: r)
@@ -220,8 +239,8 @@ instance (Generic a r, FIFOs' r brx nrx btx ntx) => FIFOs a brx nrx btx ntx wher
 class FIFOs' fifos rxBytes rxCount txBytes txCount | fifos -> rxBytes rxCount txBytes txCount where
   mkRxCredits' :: fifos -> Module (Vector rxCount (Reg (UInt 8)))
   mkTxCredits' :: fifos -> Module (Vector txCount (Reg (UInt 8)))
-  mkFIFOs' :: Vector rxCount (Reg (UInt 8)) -> (Integer -> Bool) -> ByteList -> Action ->
-              Vector txCount (Reg (UInt 8)) -> (Integer -> ByteList -> Action) ->
+  mkFIFOs' :: Vector rxCount (Reg (UInt 8)) -> (Integer -> Bool) -> ActionValue (Bit 8) -> Action ->
+              Vector txCount (Reg (UInt 8)) -> (Integer -> Action) -> (Integer -> Bit 8 -> Action) -> (Integer -> Action) ->
               Module (fifos, Rules)
 
   genCMsgTypeHeaderDcls' :: fifos -> State (List String) String
@@ -238,8 +257,8 @@ class FIFOs' fifos rxBytes rxCount txBytes txCount | fifos -> rxBytes rxCount tx
 instance (FIFOs' a brx nrx btx ntx) => FIFOs' (Meta m a) brx nrx btx ntx where
   mkRxCredits' _ = mkRxCredits' (_ :: a)
   mkTxCredits' _ = mkTxCredits' (_ :: a)
-  mkFIFOs' rxCredits rxTagEq rxBody deq txCredits enq = do
-    (fifos, rs) <- mkFIFOs' rxCredits rxTagEq rxBody deq txCredits enq
+  mkFIFOs' rxCredits rxTagEq getByte deq txCredits setTag putByte enq = do
+    (fifos, rs) <- mkFIFOs' rxCredits rxTagEq getByte deq txCredits setTag putByte enq
     return (Meta fifos, rs)
 
   genCMsgTypeHeaderDcls' _ = genCMsgTypeHeaderDcls' (_ :: a)
@@ -260,14 +279,14 @@ instance (FIFOs' a brx1 nrx1 btx1 ntx1, FIFOs' b brx2 nrx2 btx2 ntx2,
          FIFOs' (a, b) brx nrx btx ntx where
   mkRxCredits' _ = liftM2 append (mkRxCredits' (_ :: a)) (mkRxCredits' (_ :: b))
   mkTxCredits' _ = liftM2 append (mkTxCredits' (_ :: a)) (mkTxCredits' (_ :: b))
-  mkFIFOs' rxCredits rxTagEq rxBody deq txCredits enq = do
+  mkFIFOs' rxCredits rxTagEq getByte deq txCredits setTag putByte enq = do
     (fifos1, rs1) <- mkFIFOs'
-      (take rxCredits) rxTagEq rxBody deq
-      (take txCredits) (\ txTag txBody -> enq txTag txBody)
+      (take rxCredits) rxTagEq getByte deq
+      (take txCredits) setTag putByte enq
     (fifos2, rs2) <- mkFIFOs'
-      (takeTail rxCredits) rxTagEq rxBody deq
-      (takeTail txCredits) (\ txTag txBody -> enq txTag txBody)
-    return ((fifos1, fifos2), rs1 <+ rs2)
+      (takeTail rxCredits) rxTagEq getByte deq
+      (takeTail txCredits) setTag putByte enq
+    return ((fifos1, fifos2), rs1 `rJoinDescendingUrgency` rs2)
 
   genCMsgTypeHeaderDcls' _ = liftM2 strConcat (genCMsgTypeHeaderDcls' (_ :: a)) (genCMsgTypeHeaderDcls' (_ :: b))
   genCMsgTypeImplDcls' _ = liftM2 strConcat (genCMsgTypeImplDcls' (_ :: a)) (genCMsgTypeImplDcls' (_ :: b))
@@ -283,7 +302,7 @@ instance (FIFOs' a brx1 nrx1 btx1 ntx1, FIFOs' b brx2 nrx2 btx2 ntx2,
 instance FIFOs' () 0 0 0 0 where
   mkRxCredits' _ = return nil
   mkTxCredits' _ = return nil
-  mkFIFOs' _ _ _ _ _ _ = return ((), emptyRules)
+  mkFIFOs' _ _ _ _ _ _ _ _ = return ((), emptyRules)
 
   genCMsgTypeHeaderDcls' _ = return ""
   genCMsgTypeImplDcls' _ = return ""
@@ -301,11 +320,11 @@ instance (GenCRepr a gcrBytes, GenAllCDecls a, Bits a bBits) =>
          FIFOs' (Meta (MetaField name i) (Conc (Rx bFIFOSize cFIFOSize a))) gcrBytes 1 0 0 where
   mkRxCredits' _ = liftM replicate $ mkReg $ fromInteger $ valueOf bFIFOSize
   mkTxCredits' _ = return nil
-  mkFIFOs' rxCredits rxTagEq rxBody deq _ _ = do
-    fifo :: FIFOF a
-    fifo <- mkSizedFIFOF (valueOf bFIFOSize)
-    let credits :: Reg (UInt 8)
-        credits = head rxCredits
+  mkFIFOs' rxCredits rxTagEq getByte deq _ _ _ _ = do
+    fifo :: FIFOF a <- mkSizedFIFOF (valueOf bFIFOSize)
+    decoder :: ByteStreamDecoder a <- mkDecoder
+    let credits :: Reg (UInt 8) = head rxCredits
+        tag = valueOf i + 1
 
     -- TODO: A more efficient approach would be to make credits a CReg.
     -- See discussion on https://github.com/B-Lang-org/bsc-contrib/pull/22
@@ -320,11 +339,22 @@ instance (GenCRepr a gcrBytes, GenAllCDecls a, Bits a bBits) =>
 
     let rs =
           rules
-            ("handle_rx_" +++ stringOf name): when rxTagEq (valueOf i + 1) ==> do
-              fifo.enq (unpackBytes rxBody).fst
-              deq
+            when rxTagEq tag
+              rules
+                {-# aggressive_implicit_conditions #-}
+                ("unpack_rx_" +++ stringOf name): when True ==> do
+                  $display ("unpack_rx_" +++ stringOf name)
+                  bind getByte decoder.put
+
+                {-# aggressive_implicit_conditions #-}
+                ("handle_rx_" +++ stringOf name): when True ==> do
+                  $display ("handle_rx_" +++ stringOf name)
+                  fifo.enq decoder.value
+                  decoder.deq
+                  deq
 
             ("restore_credits_" +++ stringOf name): when True ==> do
+              $display ("restore_credits_" +++ stringOf name)
               restoreCredits.deq
               credits := credits + 1
 
@@ -377,17 +407,28 @@ instance (GenCRepr a gcrBytes, GenAllCDecls a, Bits a bBits) =>
          FIFOs' (Meta (MetaField name i) (Conc (Tx cFIFOSize bFIFOSize a))) 0 0 gcrBytes 1 where
   mkRxCredits' _ = return nil
   mkTxCredits' _ = liftM replicate $ mkReg 0
-  mkFIFOs' _ _ _ _ txCredits enq = do
-    fifo :: FIFOF a
-    fifo <- mkSizedFIFOF (valueOf bFIFOSize)
-    let credits :: Reg (UInt 8)
-        credits = head txCredits
+  mkFIFOs' _ _ _ _ txCredits setTag putByte enq = do
+    fifo :: FIFOF a <- mkSizedFIFOF (valueOf bFIFOSize)
+    encoder :: ByteStreamEncoder a <- mkEncoder
+    let credits :: Reg (UInt 8) = head txCredits
+        tag :: Integer = valueOf i + 1
 
     let rs =
           rules
-            ("handle_tx_" +++ stringOf name): when credits > 0 ==> do
+            ("select_tx_" +++ stringOf name): when credits > 0 ==> do
+              $display ("select_tx_" +++ stringOf name)
               credits := credits - 1
-              enq (fromInteger $ valueOf i + 1) $ packBytes fifo.first
+              setTag tag
+              encoder.put fifo.first
+
+            {-# aggressive_implicit_conditions #-}
+            ("pack_tx_" +++ stringOf name): when encoder.notDone ==> do
+              $display ("pack_tx_" +++ stringOf name)
+              bind encoder.get $ putByte tag
+
+            ("handle_tx_" +++ stringOf name): when not encoder.notDone ==> do
+              $display ("handle_tx_" +++ stringOf name)
+              enq tag
               fifo.deq
 
     return (Meta $ Conc $ toTx fifo, rs)
