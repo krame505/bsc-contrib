@@ -3,6 +3,7 @@ package GenCRepr where
 import List
 import qualified Vector
 import State
+import FIFOF
 
 -- Data being packed and unpacked is variable-width for more efficient packing
 -- if sent in serial, and also byte aligned for easier handling in C.
@@ -61,7 +62,7 @@ divideEncoder f e1 e2 =
       e1.put y
       e2.put z
     notDone = e1.notDone || e2.notDone
-    get = splitDeepAV $ if e1.notDone then nosplitDeepAV e1.get else nosplitDeepAV e2.get
+    get = if e1.notDone then e1.get else e2.get
 
 conquerEncoder :: ByteStreamEncoder a
 conquerEncoder =
@@ -467,19 +468,25 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n, Bits a nb) =>
     e :: ByteStreamEncoder a <- mkEncoder
     value :: Reg (Vector.Vector numElems a) <- mkReg _
     i :: Reg (UInt (TLog (TAdd 1 numElems))) <- mkReg $ fromInteger (valueOf numElems)
-    let done = i == fromInteger (valueOf numElems) && not e.notDone
+    encoded :: FIFOF (Bit 8) <- mkFIFOF
+    let done = i == fromInteger (valueOf numElems) && not e.notDone && not encoded.notEmpty
 
     rules
       "encode_item": when i < fromInteger (valueOf numElems) ==> do
         e.put $ Vector.select value i
         i := i + 1
+      
+      {-# aggressive_implicit_conditions #-}
+      "enq_packed": when True ==> bind e.get encoded.enq
 
     interface
       put (Meta xs) = _when_ done do
         value := Vector.map (\ (Conc x) -> x) xs
         i := 0
       notDone = not done
-      get = e.get
+      get = do
+        encoded.deq
+        return encoded.first
 
   genCPack' _ val buf = Vector.foldr (\ p1 p2 -> p1 +++ " " +++ p2) "" $ Vector.map
     (\ i -> genCPack (_ :: a) (val +++ "[" +++ integerToString i +++ "]") buf)
