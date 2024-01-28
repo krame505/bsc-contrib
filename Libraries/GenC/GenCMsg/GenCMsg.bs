@@ -98,28 +98,23 @@ instance (FIFOs fifos rxBytes rxCount txBytes txCount,
         rxTagEq i = fromInteger i == fromByteVector packedRxTag
         rxBody :: Vector rxBytes (Bit 8) = takeTail rxMsgs.first
         getByte :: ActionValue (Bit 8) = do
-          $display "getByte " (select rxBody rxIndex)
           rxIndex := rxIndex + 1
           return $ select rxBody rxIndex
         deq :: Action = do
-          $display "deq"
           zipWithM_ (\ cr c -> writeReg cr (cr + Prelude.unpack c)) txCredits (take rxMsgs.first)
           rxIndex := 0
           rxMsgs.deq
 
         setTag :: Integer -> Action
         setTag tag = _when_ (txTag == 0) do
-          $display "setTag " tag
           txTag := fromInteger tag
           txIndex := 0
         putByte :: Integer -> Bit 8 -> Action
         putByte tag x = _when_ (txTag == fromInteger tag) do
-          $display "putByte " tag " " x
           txIndex := txIndex + 1
           select txEncodeBuffer txIndex := x
         enq :: Integer -> Action
         enq tag = _when_ (txTag == fromInteger tag) do
-          $display "enq " tag " " txIndex
           mapM_ (flip writeReg 0) rxCredits
           txTag := 0
           let packedCredits :: Vector rxCount (Bit 8) =
@@ -134,12 +129,8 @@ instance (FIFOs fifos rxBytes rxCount txBytes txCount,
 
     let handleCreditsOnly =
           rules
-             "handle_tx_credits_only": when any (\ c -> readReg c > 0) rxCredits ==> do
-                $display "handle_tx_credits_only"
-                enq 0
-             "handle_rx_credits_only": when rxTagEq 0 ==> do
-                $display "handle_rx_credits_only"
-                deq
+             "handle_tx_credits_only": when any (\ c -> readReg c > 0) rxCredits ==> enq 0
+             "handle_rx_credits_only": when rxTagEq 0 ==> deq
     addRules $ rs `rJoinDescendingUrgency` handleCreditsOnly
 
     interface
@@ -342,19 +333,16 @@ instance (GenCRepr a gcrBytes, GenAllCDecls a, Bits a bBits) =>
             when rxTagEq tag
               rules
                 {-# aggressive_implicit_conditions #-}
-                ("unpack_rx_" +++ stringOf name): when True ==> do
-                  $display ("unpack_rx_" +++ stringOf name)
+                ("unpack_rx_" +++ stringOf name): when True ==>
                   bind getByte decoder.put
 
                 {-# aggressive_implicit_conditions #-}
                 ("handle_rx_" +++ stringOf name): when True ==> do
-                  $display ("handle_rx_" +++ stringOf name)
                   fifo.enq decoder.value
                   decoder.deq
                   deq
 
             ("restore_credits_" +++ stringOf name): when True ==> do
-              $display ("restore_credits_" +++ stringOf name)
               restoreCredits.deq
               credits := credits + 1
 
@@ -416,18 +404,15 @@ instance (GenCRepr a gcrBytes, GenAllCDecls a, Bits a bBits) =>
     let rs =
           rules
             ("select_tx_" +++ stringOf name): when credits > 0 ==> do
-              $display ("select_tx_" +++ stringOf name)
               credits := credits - 1
               setTag tag
               encoder.put fifo.first
 
             {-# aggressive_implicit_conditions #-}
-            ("pack_tx_" +++ stringOf name): when encoder.notDone ==> do
-              $display ("pack_tx_" +++ stringOf name)
+            ("pack_tx_" +++ stringOf name): when encoder.notDone ==>
               bind encoder.get $ putByte tag
 
             ("handle_tx_" +++ stringOf name): when not encoder.notDone ==> do
-              $display ("handle_tx_" +++ stringOf name)
               enq tag
               fifo.deq
 
