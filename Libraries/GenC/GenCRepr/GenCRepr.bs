@@ -4,6 +4,7 @@ import List
 import qualified Vector
 import State
 import FIFOF
+import SpecialFIFOs
 
 -- Data being packed and unpacked is variable-width for more efficient packing
 -- if sent in serial, and also byte aligned for easier handling in C.
@@ -39,7 +40,8 @@ byteListToVector bytes =
   in Vector.toVector $
     if diff < 0 then bytes `append` replicate diff 0 else drop (negate diff) bytes
 
--- IMPORTANT NOTE: using this requires aggressive_implicit_conditions.
+-- An interface for serializing values into a stream of bytes.
+-- IMPORTANT NOTE: using the get method requires aggressive_implicit_conditions.
 interface ByteStreamEncoder a =
   put :: a -> Action
   notDone :: Bool
@@ -71,6 +73,7 @@ conquerEncoder =
     notDone = False
     get = _when_ False $ return _
 
+-- An interface for 
 -- IMPORTANT NOTE: using this requires aggressive_implicit_conditions.
 interface ByteStreamDecoder a =
   notFull :: Bool
@@ -465,19 +468,19 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n, Bits a nb) =>
 
   packBytes' (Meta x) = Vector.foldr append Nil $ Vector.map (\ (Conc a) -> packBytes a) x
   mkEncoder' = module
-    e :: ByteStreamEncoder a <- mkEncoder
+    itemEncoder :: ByteStreamEncoder a <- mkEncoder
     value :: Reg (Vector.Vector numElems a) <- mkReg _
     i :: Reg (UInt (TLog (TAdd 1 numElems))) <- mkReg $ fromInteger (valueOf numElems)
-    encoded :: FIFOF (Bit 8) <- mkFIFOF
-    let done = i == fromInteger (valueOf numElems) && not e.notDone && not encoded.notEmpty
+    encoded :: FIFOF (Bit 8) <- mkFIFOF1
+    let done = i == fromInteger (valueOf numElems) && not itemEncoder.notDone && encoded.notFull
 
     rules
       "encode_item": when i < fromInteger (valueOf numElems) ==> do
-        e.put $ Vector.select value i
+        itemEncoder.put $ Vector.select value i
         i := i + 1
       
       {-# aggressive_implicit_conditions #-}
-      "enq_packed": when True ==> bind e.get encoded.enq
+      "enq_packed": when True ==> bind itemEncoder.get encoded.enq
 
     interface
       put (Meta xs) = _when_ done do
@@ -502,23 +505,36 @@ instance (GenCRepr a elemBytes, Mul elemBytes numElems n, Bits a nb) =>
           return $ Conc res1 :> res2
     in liftM Meta $ liftM Vector.toVector $ unpackElems (valueOf numElems)
   mkDecoder' = module
-    d :: ByteStreamDecoder a <- mkDecoder
+    itemDecoder :: ByteStreamDecoder a <- mkDecoder
     items :: Vector.Vector numElems (Reg a) <- Vector.replicateM $ mkReg _
     i :: Reg (UInt (TLog (TAdd 1 numElems))) <- mkReg 0
-    let ready = i == fromInteger (valueOf n)
+    encoded :: FIFOF (Bit 8) <- mkBypassFIFOF
+    decoded :: FIFOF (Vector.Vector numElems a) <- mkFIFOF1
 
     rules
-      "decode_item": when not ready ==> do
-        (Vector.select items i) := d.value
-        d.deq
+      {-# aggressive_implicit_conditions #-}
+      "deq_packed": when True ==> do
+        itemDecoder.put encoded.first
+        encoded.deq
+
+      {-# aggressive_implicit_conditions #-}
+      "decode_item": when i < fromInteger (valueOf n) ==> do
+        (Vector.select items i) := itemDecoder.value
+        itemDecoder.deq
         i := i + 1
 
+      "enq_unpacked": when i == fromInteger (valueOf n) ==> do
+        i := 0
+        decoded.enq $ Vector.map readReg items
+
+    let canPut :: Bool = 
+          decoded.notFull && i < fromInteger (valueOf n) && itemDecoder.notFull && encoded.notFull
     interface
-      notFull = not ready
-      put = d.put
-      hasValue = ready
-      deq = _when_ ready $ i := 0
-      value = _when_ ready $ Meta $ Vector.map (Conc `compose` readReg) items
+      notFull = decoded.notFull
+      put = _when_ canPut encoded.enq
+      hasValue = decoded.notEmpty
+      deq = _when_ (not canPut) decoded.deq  -- Condition needed b/c scheduler isn't smart enough to know this is mutually exclusive with put
+      value = Meta $ Vector.map Conc $ decoded.first
 
   genCUnpack' _ val buf = Vector.foldr (\ p1 p2 -> p1 +++ " " +++ p2) "" $ Vector.map
     (\ i -> genCUnpack (_ :: a) (val +++ "[" +++ integerToString i +++ "]") buf)
