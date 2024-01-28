@@ -98,6 +98,10 @@ instance (FIFOs fifos rxBytes rxCount txBytes txCount,
         rxTagEq i = fromInteger i == fromByteVector packedRxTag
         rxBody :: Vector rxBytes (Bit 8) = takeTail rxMsgs.first
         getByte :: ActionValue (Bit 8) = do
+          -- TODO: This should perhaps more gracefully handle corrupted messages -
+          -- if the index exceeds the remaining number of bytes, flush the decoder and discard the message.
+          -- But a dropped/corrupted message means the credits could get out of sync, so maybe there isn't
+          -- a good reason to support that anyway.
           rxIndex := rxIndex + 1
           return $ select rxBody rxIndex
         deq :: Action = do

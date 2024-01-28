@@ -122,6 +122,7 @@ class GenCRepr a n | a -> n where
   -- Pack a value of type a into a ByteList of at most n bytes.
   packBytes :: a -> ByteList
 
+  -- Synthesize a module for encoding values of type a into a stream of bytes.
   mkEncoder :: Module (ByteStreamEncoder a)
 
   -- Compute the C statement to pack a value of type a,
@@ -140,6 +141,7 @@ class GenCRepr a n | a -> n where
   -- Monadic version of unpackBytes using the State monad
   unpackBytesS :: State ByteList a
 
+  -- Synthesize a module for decoding a stream of bytes into values of type a.
   mkDecoder :: Module (ByteStreamDecoder a)
 
   -- Compute the C statement to unpack a value of type a,
