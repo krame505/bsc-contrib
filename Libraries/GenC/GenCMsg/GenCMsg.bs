@@ -2,6 +2,7 @@ package GenCMsg where
 
 import GenCRepr
 import Vector
+import SizedVector
 import qualified List
 import FIFOF
 import GetPut
@@ -13,7 +14,7 @@ class ByteVector n where
   fromByteVector :: Vector n (Bit 8) -> Bit (TMul n 8)
 
 instance ByteVector 0 where
-  toByteVector _ = nil
+  toByteVector _ = Vector.nil
   fromByteVector _ = 0
 
 instance (Add n1 1 n, ByteVector n1) => ByteVector n where
@@ -54,13 +55,10 @@ instance ToPut (Tx d s a) a where
     interface Put
       put = f.enq
 
--- Represents a variable-sized vector of max length n
-type SizedVector n a = (UInt (TLog (TAdd 1 n)), Vector n a)
-
 dropSize :: Put (Vector n a) -> Put (SizedVector n a)
 dropSize f =
     interface Put
-      put (_, v) = f.put v
+      put v = f.put v.items
 
 interface MsgManager fifos rxBytes txBytes =
   fifos :: fifos
@@ -77,7 +75,7 @@ instance (FIFOs fifos rxBytes rxCount txBytes txCount,
           Add txCount tagBytes rxHead, Add rxHead rxBytes rxTotalBytes,
           Add txCount rxRest rxTotalBytes,
           Add rxCount tagBytes txHead, Add txHead txBytes txTotalBytes,
-          ByteListToVector txBytes,
+          Add p (TLog (TAdd 1 txBytes)) (TLog (TAdd 1 txTotalBytes)),
           Generic fifos (Meta (MetaData name pkg ta 1) r)) =>
          GenCMsg fifos rxTotalBytes txTotalBytes where
   mkMsgManager = module
@@ -98,29 +96,28 @@ instance (FIFOs fifos rxBytes rxCount txBytes txCount,
           let packedTag :: Vector tagBytes (Bit 8)
               packedTag = drop ((take rxMsgs.first) :: Vector rxHead (Bit 8))
           in fromInteger i == fromByteVector packedTag
-    let rxBody :: ByteList
-        rxBody = toList ((takeTail rxMsgs.first) :: Vector rxBytes (Bit 8))
+    let rxBody :: Vector rxBytes (Bit 8)
+        rxBody = takeTail rxMsgs.first
     let deq :: Action
         deq = do
           zipWithM_ (\ cr c -> cr.inc $ Prelude.unpack c) txCredits (take rxMsgs.first)
           rxMsgs.deq
-    let enq :: Integer -> ByteList -> Action
+    let enq :: Integer -> SizedVector txBytes (Bit 8) -> Action
         enq txTag txBody = do
           mapM_ (.zero) rxCredits
           let packedCredits :: Vector rxCount (Bit 8)
               packedCredits = map (\ cr -> Prelude.pack cr.value) rxCredits
           let packedTag :: Vector tagBytes (Bit 8)
               packedTag = toByteVector $ fromInteger txTag
-          let packedBody :: Vector txBytes (Bit 8)
-              packedBody = byteListToVector txBody
-          txMsgs.enq
-            (fromInteger $ valueOf txHead + List.length txBody,
-             packedCredits `append` packedTag `append` packedBody)
+          txMsgs.enq $ SizedVector {
+            size = fromInteger (valueOf txHead) + zeroExtend txBody.size;
+            items = packedCredits `Vector.append` packedTag `Vector.append` txBody.items;
+          }
     (fifos, rs) :: (fifos, Rules) <- mkFIFOs rxCredits rxTagEq rxBody deq txCredits enq
 
     let handleCreditsOnly =
           rules
-             "handle_tx_credits_only": when any (\ cr -> cr.value > 0) rxCredits ==> enq 0 List.nil
+             "handle_tx_credits_only": when any (\ cr -> cr.value > 0) rxCredits ==> enq 0 nil
              "handle_rx_credits_only": when rxTagEq 0 ==> deq
     addRules $ rs `rJoinDescendingUrgency` handleCreditsOnly
 
@@ -203,8 +200,8 @@ mkCounter init = module
 class FIFOs fifos rxBytes rxCount txBytes txCount | fifos -> rxBytes rxCount txBytes txCount where
   mkRxCredits :: fifos -> Module (Vector rxCount Counter)
   mkTxCredits :: fifos -> Module (Vector txCount Counter)
-  mkFIFOs :: Vector rxCount Counter -> (Integer -> Bool) -> ByteList -> Action ->
-             Vector txCount Counter -> (Integer -> ByteList -> Action) ->
+  mkFIFOs :: Vector rxCount Counter -> (Integer -> Bool) -> Vector rxBytes (Bit 8) -> Action ->
+             Vector txCount Counter -> (Integer -> SizedVector txBytes (Bit 8) -> Action) ->
              Module (fifos, Rules)
 
   genCMsgTypeHeaderDcls :: fifos -> State (List String) String
@@ -239,8 +236,8 @@ instance (Generic a r, FIFOs' r brx nrx btx ntx) => FIFOs a brx nrx btx ntx wher
 class FIFOs' fifos rxBytes rxCount txBytes txCount | fifos -> rxBytes rxCount txBytes txCount where
   mkRxCredits' :: fifos -> Module (Vector rxCount Counter)
   mkTxCredits' :: fifos -> Module (Vector txCount Counter)
-  mkFIFOs' :: Vector rxCount Counter -> (Integer -> Bool) -> ByteList -> Action ->
-              Vector txCount Counter -> (Integer -> ByteList -> Action) ->
+  mkFIFOs' :: Vector rxCount Counter -> (Integer -> Bool) -> Vector rxBytes (Bit 8) -> Action ->
+              Vector txCount Counter -> (Integer -> SizedVector txBytes (Bit 8) -> Action) ->
               Module (fifos, Rules)
 
   genCMsgTypeHeaderDcls' :: fifos -> State (List String) String
@@ -274,18 +271,19 @@ instance (FIFOs' a brx nrx btx ntx) => FIFOs' (Meta m a) brx nrx btx ntx where
 
 instance (FIFOs' a brx1 nrx1 btx1 ntx1, FIFOs' b brx2 nrx2 btx2 ntx2,
           Max brx1 brx2 brx, Max btx1 btx2 btx,
-          Add brx1 prx1 brx, Add brx2 prx2 brx, Add btx1 ptx1 btx, Add btx2 ptx2 btx,
+          Add brx1 prx1 brx, Add brx2 prx2 brx,
+          AppendSizedVector btx1 ptx1 btx, AppendSizedVector btx2 ptx2 btx,
           Add nrx1 nrx2 nrx, Add ntx1 ntx2 ntx) =>
          FIFOs' (a, b) brx nrx btx ntx where
-  mkRxCredits' _ = liftM2 append (mkRxCredits' (_ :: a)) (mkRxCredits' (_ :: b))
-  mkTxCredits' _ = liftM2 append (mkTxCredits' (_ :: a)) (mkTxCredits' (_ :: b))
+  mkRxCredits' _ = liftM2 Vector.append (mkRxCredits' (_ :: a)) (mkRxCredits' (_ :: b))
+  mkTxCredits' _ = liftM2 Vector.append (mkTxCredits' (_ :: a)) (mkTxCredits' (_ :: b))
   mkFIFOs' rxCredits rxTagEq rxBody deq txCredits enq = do
     (fifos1, rs1) <- mkFIFOs'
-      (take rxCredits) rxTagEq rxBody deq
-      (take txCredits) (\ txTag txBody -> enq txTag txBody)
+      (take rxCredits) rxTagEq (take rxBody) deq
+      (take txCredits) (\ txTag txBody -> enq txTag $ extend txBody)
     (fifos2, rs2) <- mkFIFOs'
-      (takeTail rxCredits) rxTagEq rxBody deq
-      (takeTail txCredits) (\ txTag txBody -> enq txTag txBody)
+      (takeTail rxCredits) rxTagEq (take rxBody) deq
+      (takeTail txCredits) (\ txTag txBody -> enq txTag $ extend txBody)
     return ((fifos1, fifos2), rs1 `rJoinDescendingUrgency` rs2)
 
   genCMsgTypeHeaderDcls' _ = liftM2 strConcat (genCMsgTypeHeaderDcls' (_ :: a)) (genCMsgTypeHeaderDcls' (_ :: b))
@@ -300,8 +298,8 @@ instance (FIFOs' a brx1 nrx1 btx1 ntx1, FIFOs' b brx2 nrx2 btx2 ntx2,
   genCFIFOImplDcls' _ name = genCFIFOImplDcls' (_ :: a) name +++ genCFIFOImplDcls' (_ :: b) name
 
 instance FIFOs' () 0 0 0 0 where
-  mkRxCredits' _ = return nil
-  mkTxCredits' _ = return nil
+  mkRxCredits' _ = return Vector.nil
+  mkTxCredits' _ = return Vector.nil
   mkFIFOs' _ _ _ _ _ _ = return ((), emptyRules)
 
   genCMsgTypeHeaderDcls' _ = return ""
@@ -319,7 +317,7 @@ instance FIFOs' () 0 0 0 0 where
 instance (GenCRepr a gcrBytes, GenAllCDecls a, Bits a bBits) =>
          FIFOs' (Meta (MetaField name i) (Conc (Rx bFIFOSize cFIFOSize a))) gcrBytes 1 0 0 where
   mkRxCredits' _ = liftM replicate $ mkCounter $ valueOf bFIFOSize
-  mkTxCredits' _ = return nil
+  mkTxCredits' _ = return Vector.nil
   mkFIFOs' rxCredits rxTagEq rxBody deq _ _ = do
     fifo :: FIFOF a
     fifo <- mkSizedFIFOF (valueOf bFIFOSize)
@@ -335,7 +333,7 @@ instance (GenCRepr a gcrBytes, GenAllCDecls a, Bits a bBits) =>
     let rs =
           rules
             ("handle_rx_" +++ stringOf name): when rxTagEq (valueOf i + 1) ==> do
-              fifo.enq (unpackBytes rxBody).fst
+              fifo.enq $ unpackBytes rxBody
               deq
 
     return (Meta $ Conc fifo_o, rs)
@@ -385,7 +383,7 @@ instance (GenCRepr a gcrBytes, GenAllCDecls a, Bits a bBits) =>
 -- B sending, C receiving
 instance (GenCRepr a gcrBytes, GenAllCDecls a, Bits a bBits) =>
          FIFOs' (Meta (MetaField name i) (Conc (Tx cFIFOSize bFIFOSize a))) 0 0 gcrBytes 1 where
-  mkRxCredits' _ = return nil
+  mkRxCredits' _ = return Vector.nil
   mkTxCredits' _ = liftM replicate $ mkCounter 0
   mkFIFOs' _ _ _ _ txCredits enq = do
     fifo :: FIFOF a

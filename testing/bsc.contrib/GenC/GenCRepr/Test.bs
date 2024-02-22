@@ -48,7 +48,7 @@ actTestThing tm = do
   $display (cshow input)
   output <- test_fn input
   $display (cshow output)
-  $display (cshow $ GenCRepr.toByteList output)
+  $display (cshow $ (toChunks output) :: Vector n (Bit 8))
   let res = (GenCRepr.unpack output) :: Thing
   $display (cshow res)
 
