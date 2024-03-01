@@ -429,8 +429,7 @@ class UnpackUnionBody nt a i n m | nt a m -> i n where
 instance (GenCUnionBody tagBytes a i1 n1, GenCUnionBody tagBytes b i2 n2,
           Max n1 n2 n,
           AppendSizedVector n1 p1 n,
-          AppendSizedVector n2 p2 n,
-          Mul tagBytes 8 tagBits) =>
+          AppendSizedVector n2 p2 n) =>
          GenCUnionBody tagBytes (Either a b) i2 n where
   genCEnumBody _ _ typeName =
     genCEnumBody (_ :: Bit tagBytes) (_ :: a) typeName +++ ", " +++
