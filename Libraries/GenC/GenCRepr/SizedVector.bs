@@ -1,7 +1,7 @@
 package SizedVector where
 
 -- TODO: Where should this library live?
--- It is used in both the COBS and GenC libraries, which are other wise independent.
+-- It is used in both the COBS and GenC libraries, which are otherwise independent.
 
 import Vector
 
@@ -26,18 +26,19 @@ instance (Add n1 n2 n,
           Add p1 (TLog (TAdd 1 n1)) (SizeBits n), 
           Add p2 (TLog (TAdd 1 n2)) (SizeBits n)) =>
          AppendSizedVector n1 n2 n where
+    append :: SizedVector n1 a -> SizedVector n2 a -> SizedVector n a
     append v1 v2 = SizedVector {
-    size = zeroExtend v1.size + zeroExtend v2.size;
-    items = genWith $ \ i ->
-      let index :: UInt (SizeBits n) = fromInteger i
-      in
-        if index < zeroExtend v1.size
-        then v1.items !! i
-        -- Check if n2 is 0 here to workaround for bsc bug,
-        -- trying to elaborate a select from an empty array.
-        else if index < zeroExtend v1.size + zeroExtend v2.size && valueOf n2 /= 0
-        then select v2.items $ index - zeroExtend v1.size
-        else _;
+      size = zeroExtend v1.size + zeroExtend v2.size;
+      items =
+        let options :: Vector (TAdd 1 n1) (Vector n a) =
+              genWith $ \ i ->
+                genWith $ \ j ->
+                  if j < i
+                  then v1.items !! j
+                  else if j < i + valueOf n2
+                  then v2.items !! (j - i)
+                  else _;
+        in select options v1.size;
     }
 
 class ConcatSizedVector n m o | n m -> o where
