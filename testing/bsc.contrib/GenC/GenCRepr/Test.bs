@@ -40,7 +40,7 @@ struct ThingMsg =
   swapXY :: Bool
   deltaZ :: Int 5
 
-actTestThing :: ThingMsg -> Action
+actTestThing :: (GenCRepr Thing n) => ThingMsg -> Action
 actTestThing tm = do
   $display (cshow tm)
   $display (cshow $ GenCRepr.packBytes tm)

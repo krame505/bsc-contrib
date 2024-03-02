@@ -2,9 +2,11 @@ package SizedVector where
 
 import Vector
 
+type SizeBits n = TLog (TAdd 1 n)
+
 -- Represents a variable-sized vector of max length n
 struct SizedVector n a = 
-  size :: UInt (TLog (TAdd 1 n))
+  size :: UInt (SizeBits n)
   items :: Vector n a
  deriving (Eq, Bits)
 
@@ -18,15 +20,19 @@ class AppendSizedVector n1 n2 n | n1 n2 -> n where
   append :: SizedVector n1 a -> SizedVector n2 a -> SizedVector n a
 
 instance (Add n1 n2 n, 
-          Add p1 (TLog (TAdd 1 n1)) (TLog (TAdd 1 n)), 
-          Add p2 (TLog (TAdd 1 n2)) (TLog (TAdd 1 n))) =>
+          Add p1 (TLog (TAdd 1 n1)) (SizeBits n), 
+          Add p2 (TLog (TAdd 1 n2)) (SizeBits n)) =>
          AppendSizedVector n1 n2 n where
     append v1 v2 = SizedVector {
     size = zeroExtend v1.size + zeroExtend v2.size;
     items = genWith $ \ i ->
-        if fromInteger i < v1.size
+      let index :: UInt (SizeBits n) = fromInteger i
+      in
+        -- Check valueOf n2 == 0 here to workaround for bsc bug,
+        -- trying to elaborate a select from an empty array.
+        if index < zeroExtend v1.size || valueOf n2 == 0
         then v1.items !! i
-        else select v2.items $ fromInteger i - v1.size;
+        else select v2.items $ index - zeroExtend v1.size;
     }
 
 class ConcatSizedVector n1 n2 n | n1 n2 -> n where

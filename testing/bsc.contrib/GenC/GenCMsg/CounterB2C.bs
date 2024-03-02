@@ -5,6 +5,7 @@ import GenCMsg
 import CounterIface
 import CShow
 import Vector
+import SizedVector
 import GetPut
 
 -- Note that changing the message data definitions in this file may affect the
@@ -64,11 +65,11 @@ sysCounterB2C = module
 
     "receive_message": when messageAvailable ==> do
       m <- getMessage
-      let mBytes = unpack m
+      let mBytes = (unpack m)
       -- $display "B received message " (cshow (mBytes :: Vector 8 (Bit 8)))
       msgMgr.rxMsg.put mBytes
 
     "send_message": when True ==> do
-      (_, mBytes) <- msgMgr.txMsg.get
-      -- $display "B sending message " (cshow (mBytes :: Vector 8 (Bit 8)))
-      putMessage (pack mBytes)
+      mBytes <- msgMgr.txMsg.get
+      -- $display "B sending message " (cshow (mBytes.items :: Vector 8 (Bit 8)))
+      putMessage (pack mBytes.items)

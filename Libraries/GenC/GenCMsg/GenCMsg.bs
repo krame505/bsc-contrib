@@ -75,7 +75,7 @@ instance (FIFOs fifos rxBytes rxCount txBytes txCount,
           Add txCount tagBytes rxHead, Add rxHead rxBytes rxTotalBytes,
           Add txCount rxRest rxTotalBytes,
           Add rxCount tagBytes txHead, Add txHead txBytes txTotalBytes,
-          Add p (TLog (TAdd 1 txBytes)) (TLog (TAdd 1 txTotalBytes)),
+          Add p (SizeBits txBytes) (SizeBits txTotalBytes),
           Generic fifos (Meta (MetaData name pkg ta 1) r)) =>
          GenCMsg fifos rxTotalBytes txTotalBytes where
   mkMsgManager = module

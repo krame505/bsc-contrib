@@ -5,19 +5,6 @@ import SizedVector
 import qualified List
 import State
 
--- TODO: Move this to the Vector library.
---@ Inverse of toChunks - convert a vector of chunks to a value,
---@ dropping any padding on the final chunk.
---@ \index{fromChunks@\te{fromChunks} (\te{Vector} function)}
---@ \begin{libverbatim}
---@ function t fromChunks(Vector#(n,ch) x)
---@    provisos( Bits#(ch,ch_sz)
---@            , Bits#(t,out_sz)
---@            , Div#(out_sz,ch_sz,n) );
---@ \end{libverbatim}
-fromChunks :: (Bits ch ch_sz, Bits t out_sz, Div out_sz ch_sz n) => Vector n ch -> t
-fromChunks x = Prelude.unpack $ (Prelude.pack x)[valueOf out_sz - 1:0]
-
 -- Class of types that can be represented and automatically packed/unpacked in C.
 -- n is the maximum number of bytes needed to pack a type.
 -- genC* methods in this class are parameterized by a proxy value to specify the type.
@@ -65,15 +52,15 @@ unpackBytes :: (GenCRepr a n) => Vector n (Bit 8) -> a
 unpackBytes x = (unpackBytesM.run x 0).fst
 
 -- Pack a value into a Bit representation that is guaranteed to fit the type.
-pack :: (GenCRepr a n, Mul n 8 m) => a -> Bit m
-pack x = Prelude.pack (packBytes x).items
+pack :: (GenCRepr a m, Mul m 8 n, Div n 8 m, Add p n (TMul m 8)) => a -> Bit n
+pack x = bitsFromBytes (packBytes x).items
 
 -- Unpack a value from a Bit representation that is guaranteed to fit the type.
-unpack :: (GenCRepr a n, Mul n 8 m) => Bit m -> a
-unpack x = unpackBytes $ Prelude.unpack x
+unpack :: (GenCRepr a m, Mul m 8 n, Div n 8 m, Add p n (TMul m 8)) => Bit n -> a
+unpack = unpackBytes ∘ bitsToBytes
 
 struct ByteDecoder n a =
-  run :: Vector n (Bit 8) -> UInt (TLog (TAdd 1 n)) -> (a, UInt (TLog (TAdd 1 n)))
+  run :: Vector n (Bit 8) -> UInt (SizeBits n) -> (a, UInt (SizeBits n))
 
 instance Monad (ByteDecoder n) where
   bind a f = ByteDecoder {
@@ -93,6 +80,20 @@ peekBytes :: (Add n k m) => ByteDecoder m (Vector n (Bit 8))
 peekBytes = ByteDecoder {
   run = \ bytes index -> (genWith $ \ i -> select bytes (index + fromInteger i), index)
 }
+
+bitsToBytes :: (Div n 8 m, Add p n (TMul m 8)) => Bit n -> Vector m (Bit 8)
+bitsToBytes = reverse ∘ Prelude.unpack ∘ zeroExtend
+
+bitsFromBytes :: (Div n 8 m, Add p n (TMul m 8)) => Vector m (Bit 8) -> Bit n
+bitsFromBytes = truncate ∘ Prelude.pack ∘ reverse
+
+class PrimBytes a n | a -> n where
+  packPrim :: a -> Vector n (Bit 8)
+  unpackPrim :: Vector n (Bit 8) -> a
+
+instance (Bits a numBits, Div numBits 8 n, Add p numBits (TMul n 8)) => PrimBytes a n where
+  packPrim = bitsToBytes ∘ Prelude.pack
+  unpackPrim = Prelude.unpack ∘ bitsFromBytes
 
 -- Helpers to determine the C types and packing/unpacking code for various
 -- integer types.
@@ -135,25 +136,25 @@ genCIntUnpack numBytes val buf =
      ) +++ " *" +++ buf +++ " += " +++ integerToString numBytes +++ ";"
 
 -- Explcit instances for specific primitive types
-instance (Div b 8 n) => GenCRepr (UInt b) n where
+instance (PrimBytes (UInt b) n) => GenCRepr (UInt b) n where
   typeName _ = "uint" +++ integerToString (valueOf b)
 
   genCType _ = genCIntType False (valueOf n)
 
-  packBytes x = fromFullVector $ toChunks x
+  packBytes x = fromFullVector $ packPrim x
   genCPack _ = genCIntPack (valueOf n)
 
   genCUnpack _ = genCIntUnpack (valueOf n)
 
-instance (Div b 8 n) => UnpackBytes (UInt b) n m where
-  unpackBytesM = fmap fromChunks consumeBytes
+instance (PrimBytes (UInt b) n) => UnpackBytes (UInt b) n m where
+  unpackBytesM = fmap unpackPrim consumeBytes
 
-instance (Div b 8 n) => GenCRepr (Int b) n where
+instance (PrimBytes (Int b) n) => GenCRepr (Int b) n where
   typeName _ = "int" +++ integerToString (valueOf b)
 
   genCType _ = genCIntType True (valueOf n)
 
-  packBytes x = fromFullVector $ toChunks x
+  packBytes x = fromFullVector $ packPrim x
   genCPack _ = genCIntPack (valueOf n)
 
   genCUnpack _ val buf =
@@ -166,8 +167,8 @@ instance (Div b 8 n) => GenCRepr (Int b) n where
           "\t// Signed type does not exactly fit a C integer type, pad with the sign bit\n" +++
           "\t" +++ val +++ " |= " +++ val +++ " >> " +++ integerToString (valueOf b - 1) +++ " == 0? 0 : -1 << " +++ integerToString (valueOf b) +++ ";"
 
-instance (Div b 8 n) => UnpackBytes (Int b) n m where
-  unpackBytesM = fmap fromChunks consumeBytes
+instance (PrimBytes (Int b) n) => UnpackBytes (Int b) n m where
+  unpackBytesM = fmap unpackPrim consumeBytes
 
 instance GenCRepr Bool 1 where
   typeName _ = "bool"
@@ -180,7 +181,7 @@ instance GenCRepr Bool 1 where
   genCUnpack _ = genCIntUnpack 1
 
 instance UnpackBytes Bool 1 m where
-  unpackBytesM = fmap fromChunks consumeBytes
+  unpackBytesM = fmap unpackPrim consumeBytes
 
 -- Default instance uses generics for arbitrary data types
 instance (Generic a r, GenCRepr' r n, UnpackBytes a n n) => GenCRepr a n where
@@ -217,26 +218,22 @@ class UnpackBytes' a n m | a m -> n where
   unpackBytesM' :: (Add n k m) => ByteDecoder m a
 
 -- Primitive types with Bits instances are represented like unsigned integers
-instance (Bits a numBits, Div numBits 8 n, Mul n 8 numBitsPadded,
-          Add numBits numPad numBitsPadded) =>
-         GenCRepr' (ConcPrim a) n where
+instance (PrimBytes a n) => GenCRepr' (ConcPrim a) n where
   -- Same name for all primitive types, but these also have the same C representation
-  typeName' _ = "prim" +++ integerToString (valueOf numBits)
+  typeName' _ = "prim" +++ integerToString (valueOf n * 8)
 
   genCType' _ = genCIntType False (valueOf n)
   genCTypeDecl' _ = Nothing
 
-  packBytes' (ConcPrim x) = fromFullVector $ toChunks x
+  packBytes' (ConcPrim x) = fromFullVector $ packPrim x
   genCPack' _ = genCIntPack (valueOf n)
   genCPackDecl' _ = Nothing
 
   genCUnpack' _ = genCIntUnpack (valueOf n)
   genCUnpackDecl' _ = Nothing
 
-instance (Bits a numBits, Div numBits 8 n, Mul n 8 numBitsPadded,
-          Add numBits numPad numBitsPadded) =>
-         UnpackBytes' (ConcPrim a) n m where
-  unpackBytesM' = fmap (ConcPrim ∘ fromChunks) consumeBytes
+instance (PrimBytes a n) => UnpackBytes' (ConcPrim a) n m where
+  unpackBytesM' = fmap (ConcPrim ∘ unpackPrim) consumeBytes
 
 -- Single constructor corresponds to flat struct
 instance (GenCStructBody bodyRepr n, TypeNames ta) =>

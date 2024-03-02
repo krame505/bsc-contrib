@@ -3,6 +3,7 @@ package CounterB2B where
 import GenCMsg
 import CShow
 import Vector
+import SizedVector
 import FIFO
 import GetPut
 
@@ -27,7 +28,7 @@ interface CounterMsgs req resp =
 
 interface CounterDevice =
   putMsg :: (GenCMsg (CounterMsgs Rx Tx) rxBytes txBytes) => Vector rxBytes (Bit 8) -> Action
-  getMsg :: (GenCMsg (CounterMsgs Rx Tx) rxBytes txBytes) => ActionValue (UInt (TLog (TAdd 1 txBytes)), Vector txBytes (Bit 8))
+  getMsg :: (GenCMsg (CounterMsgs Rx Tx) rxBytes txBytes) => ActionValue (SizedVector txBytes (Bit 8))
 
 mkCounterDevice :: Module CounterDevice
 mkCounterDevice = module
@@ -62,7 +63,7 @@ mkCounterDevice = module
 
 interface CounterController =
   putMsg :: (GenCMsg (CounterMsgs Tx Rx) rxBytes txBytes) => Vector rxBytes (Bit 8) -> Action
-  getMsg :: (GenCMsg (CounterMsgs Tx Rx) rxBytes txBytes) => ActionValue (UInt (TLog (TAdd 1 txBytes)), Vector txBytes (Bit 8))
+  getMsg :: (GenCMsg (CounterMsgs Tx Rx) rxBytes txBytes) => ActionValue (SizedVector txBytes (Bit 8))
 
 mkCounterController :: Module CounterController
 mkCounterController = module
@@ -114,8 +115,8 @@ sysCounterB2B = module
 
   rules
     "get_controller": when True ==> do
-      (_, m) <- cc.getMsg
-      ctod.enq m
+      m <- cc.getMsg
+      ctod.enq m.items
 
     "put_controller": when True ==> do
       let m = dtoc.first
@@ -123,8 +124,8 @@ sysCounterB2B = module
       cc.putMsg m
 
     "get_device": when True ==> do
-      (_, m) <- cd.getMsg
-      dtoc.enq m
+      m <- cd.getMsg
+      dtoc.enq m.items
 
     "put_device": when True ==> do
       let m = ctod.first
