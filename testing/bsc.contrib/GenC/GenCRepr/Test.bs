@@ -1,6 +1,7 @@
 package Test where
 
 import GenCRepr
+import SizedVector
 import TestFn
 import CShow
 import Vector
@@ -52,10 +53,16 @@ actTestThing tm = do
   let res = (GenCRepr.unpack output) :: Thing
   $display (cshow res)
 
+items :: Vector 4 (Maybe (UInt 8))
+items = Just 4 :> Nothing :> Just 6 :> Nothing :> Vector.nil
+
+itemsUnpacked :: Vector 4 (Maybe (UInt 8))
+itemsUnpacked = GenCRepr.unpackBytes (GenCRepr.packBytes items).items
+
 {-# verilog sysTest #-}
 sysTest :: Module Empty
 sysTest = module
-  writeCDecls "test" (_ :: (Baz, Qux, Kaz, Tux, Enum, Maybe (Int 16), Maybe (Bit 32), Either Bool (Vector 3 (UInt 8)), ThingMsg))
+  writeCDecls "test" (_ :: (Baz, Qux, Kaz, Tux, Enum, Maybe (Int 16), Maybe (Bit 32), Either Bool (Vector 3 (UInt 8)), Vector 4 (Maybe (UInt 8)), ThingMsg))
 
   rules
     when True ==> do
@@ -63,6 +70,10 @@ sysTest = module
       $display (cshow $ GenCRepr.packBytes E2)
       $display (cshow $ GenCRepr.packBytes E3)
       $display (cshow $ GenCRepr.packBytes E4)
-      actTestThing (ThingMsg {thing=Thing {w=1:>2:>nil; x=1; y=2; z=0x1234;}; swapXY=False; deltaZ=8;})
-      actTestThing (ThingMsg {thing=Thing {w=1:>2:>nil; x=1; y=2; z=0x1234;}; swapXY=True; deltaZ=negate 8;})
+      $display (cshow $ GenCRepr.packBytes $ (Just 0x1234) :: Maybe (UInt 16))
+      $display (cshow $ GenCRepr.packBytes $ Nothing :: Maybe (UInt 16))
+      $display (cshow $ GenCRepr.packBytes items)
+      $display (cshow itemsUnpacked)
+      actTestThing (ThingMsg {thing=Thing {w=1:>2:>Vector.nil; x=1; y=2; z=0x1234;}; swapXY=False; deltaZ=8;})
+      actTestThing (ThingMsg {thing=Thing {w=1:>2:>Vector.nil; x=1; y=2; z=0x1234;}; swapXY=True; deltaZ=negate 8;})
       $finish

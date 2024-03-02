@@ -23,8 +23,8 @@ class AppendSizedVector n1 n2 n | n1 n2 -> n where
   append :: SizedVector n1 a -> SizedVector n2 a -> SizedVector n a
 
 instance (Add n1 n2 n, 
-          Add p1 (TLog (TAdd 1 n1)) (SizeBits n), 
-          Add p2 (TLog (TAdd 1 n2)) (SizeBits n)) =>
+          Add p1 (SizeBits n1) (SizeBits n), 
+          Add p2 (SizeBits n2) (SizeBits n)) =>
          AppendSizedVector n1 n2 n where
     append :: SizedVector n1 a -> SizedVector n2 a -> SizedVector n a
     append v1 v2 = SizedVector {
@@ -52,4 +52,4 @@ instance (ConcatSizedVector n1' n2 n', Add n1' 1 n1, AppendSizedVector n' n2 n) 
   concat v = append (head v) (concat $ tail v)
 
 extend :: (AppendSizedVector n k m) => SizedVector n a -> SizedVector m a
-extend v = append v $ fromFullVector $ replicate _
+extend v = SizedVector { size = zeroExtend v.size; items = Vector.append v.items $ replicate _; }

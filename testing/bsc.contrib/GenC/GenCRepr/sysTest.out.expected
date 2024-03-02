@@ -2,6 +2,10 @@ SizedVector {size=1; items=[0x00]}
 SizedVector {size=1; items=[0x01]}
 SizedVector {size=1; items=[0x02]}
 SizedVector {size=1; items=[0x03]}
+SizedVector {size=3; items=[0x01, 0x12, 0x34]}
+SizedVector {size=1; items=[0x00, 0xaa, 0xaa]}
+SizedVector {size= 6; items=[0x01, 0x04, 0x00, 0x01, 0x06, 0x00, 0xaa, 0xaa]}
+[Valid   4, Invalid, Valid   6, Invalid]
 ThingMsg {thing=Thing {w=[   1,    2]; x=  1; y=  2; z=  4660}; swapXY=False; deltaZ=  8}
 SizedVector {size= 8; items=[0x01, 0x02, 0x01, 0x02, 0x12, 0x34, 0x00, 0x08]}
 0x0102010212340008
