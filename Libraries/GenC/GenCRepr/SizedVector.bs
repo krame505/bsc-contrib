@@ -31,11 +31,13 @@ instance (Add n1 n2 n,
     items = genWith $ \ i ->
       let index :: UInt (SizeBits n) = fromInteger i
       in
-        -- Check valueOf n2 == 0 here to workaround for bsc bug,
-        -- trying to elaborate a select from an empty array.
-        if index < zeroExtend v1.size || valueOf n2 == 0
+        if index < zeroExtend v1.size
         then v1.items !! i
-        else select v2.items $ index - zeroExtend v1.size;
+        -- Check if n2 is 0 here to workaround for bsc bug,
+        -- trying to elaborate a select from an empty array.
+        else if index < zeroExtend v1.size + zeroExtend v2.size && valueOf n2 /= 0
+        then select v2.items $ index - zeroExtend v1.size
+        else _;
     }
 
 class ConcatSizedVector n m o | n m -> o where
