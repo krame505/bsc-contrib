@@ -1,5 +1,8 @@
 package SizedVector where
 
+-- TODO: Where should this library live?
+-- It is used in both the COBS and GenC libraries, which are other wise independent.
+
 import Vector
 
 type SizeBits n = TLog (TAdd 1 n)

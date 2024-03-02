@@ -8,6 +8,9 @@ LIBNAME=COBS
 # and defines the install target
 include ../common.mk
 
+# Requires files in GenCRepr
+BSCFLAGS += -p $(BUILDDIR)/../GenC/GenCRepr:+
+
 .PHONY: build
 build:
 	$(BSC) -u $(BSCFLAGS) $(notdir $(LIBNAME)).bs

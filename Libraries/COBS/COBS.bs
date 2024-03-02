@@ -3,28 +3,29 @@ package COBS where
 import FIFO
 import GetPut
 import Vector
+import SizedVector
 
 -- Implementation of Consistent Overhead Byte Stuffing (COBS) encoding of messages into a byte stream.
 -- See https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing
 
 interface (COBSEncoder :: # -> *) n =
-  msg :: Put (UInt (TLog (TAdd 1 n)), Vector n (Bit 8))
+  msg :: Put (SizedVector n (Bit 8))
   byte :: Get (Bit 8)
 
-mkCOBSEncoder :: (Log (TAdd 1 n) sizeWidth) => Module (COBSEncoder n)
+mkCOBSEncoder :: Module (COBSEncoder n)
 mkCOBSEncoder = module
-  msgs :: FIFO (UInt sizeWidth, Vector n (Bit 8)) <- mkFIFO
+  msgs :: FIFO (SizedVector n (Bit 8)) <- mkFIFO
   bytes :: FIFO (Bit 8) <- mkFIFO
 
-  let size :: UInt (TMax sizeWidth 8) = zeroExtend msgs.first.fst
-  let msg :: Vector n (Bit 8) = msgs.first.snd
+  let size :: UInt (TMax (SizeBits n) 8) = zeroExtend msgs.first.size
+  let msg :: Vector n (Bit 8) = msgs.first.items
 
   -- Index of the next byte to encode
-  i :: Reg (UInt (TMax sizeWidth 8)) <- mkReg 0
+  i :: Reg (UInt (TMax (SizeBits n) 8)) <- mkReg 0
   -- Distance from i to the next zero / overhead / end of message byte
   j :: Reg (UInt 8) <- mkReg 0
   -- Index of the next overhead byte to be inserted
-  nextOverhead :: Reg (Maybe (UInt (TMax sizeWidth 8))) <- mkReg $ Just 0
+  nextOverhead :: Reg (Maybe (UInt (TMax (SizeBits n) 8))) <- mkReg $ Just 0
 
   let byteI = select msg i
   let foundNextZero =
@@ -67,16 +68,16 @@ mkCOBSEncoder = module
 
 
 interface (COBSDecoder :: # -> *) n =
-  msg :: Get (UInt (TLog (TAdd 1 n)), Vector n (Bit 8))
+  msg :: Get (SizedVector n (Bit 8))
   byte :: Put (Bit 8)
 
-mkCOBSDecoder :: (Log (TAdd 1 n) sizeWidth) => Module (COBSDecoder n)
+mkCOBSDecoder :: Module (COBSDecoder n)
 mkCOBSDecoder = module
-  msgs :: FIFO (UInt sizeWidth, Vector n (Bit 8)) <- mkFIFO
+  msgs :: FIFO (SizedVector n (Bit 8)) <- mkFIFO
   bytes :: FIFO (Bit 8) <- mkFIFO
 
   -- Index of the next result byte to be decoded
-  i :: Reg (UInt sizeWidth) <- mkReg 0
+  i :: Reg (UInt (SizeBits n)) <- mkReg 0
   -- Distance to the next zero / overhead / end of message byte
   j :: Reg (UInt 8) <- mkReg 0
   -- Is the next zero / overhead / end of message byte an overhead byte?
@@ -88,7 +89,7 @@ mkCOBSDecoder = module
     "next_msg": when bytes.first == 0 ==> do
       -- $display "next_msg"
       bytes.deq
-      msgs.enq (i, map readReg msg)
+      msgs.enq $ SizedVector { size = i; items = map readReg msg; }
       i := 0
       j := 0
       isOverhead := True
