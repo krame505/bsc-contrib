@@ -38,15 +38,23 @@ instance (Add n1 n2 n,
         else select v2.items $ index - zeroExtend v1.size;
     }
 
-class ConcatSizedVector n1 n2 n | n1 n2 -> n where
-  concat :: Vector n1 (SizedVector n2 a) -> SizedVector n a
+class ConcatSizedVector n m o | n m -> o where
+  concat :: Vector n (SizedVector m a) -> SizedVector o a
 
-instance ConcatSizedVector 0 n 0 where
+instance ConcatSizedVector 0 m 0 where
   concat _ = nil
 
-instance (ConcatSizedVector n1' n2 n', Add n1' 1 n1, AppendSizedVector n' n2 n) =>
-         ConcatSizedVector n1 n2 n where
-  concat v = append (head v) (concat $ tail v)
+instance ConcatSizedVector 1 m m where
+  concat v = head v
+
+instance (Div n 2 n1, Add n1 n2 n,
+          ConcatSizedVector n1 m o1, ConcatSizedVector n2 m o2, AppendSizedVector o1 o2 o) =>
+         ConcatSizedVector n m o where
+  concat :: Vector n (SizedVector m a) -> SizedVector o a
+  concat v =
+    let v1 :: Vector n1 (SizedVector m a) = take v
+        v2 :: Vector n2 (SizedVector m a) = drop v
+    in append (concat v1) (concat v2)
 
 extend :: (AppendSizedVector n k m) => SizedVector n a -> SizedVector m a
 extend v = append v $ fromFullVector $ replicate _
