@@ -4,6 +4,7 @@ package SizedVector where
 -- It is used in both the COBS and GenC libraries, which are otherwise independent.
 
 import Vector
+import Array
 
 type SizeBits n = TLog (TAdd 1 n)
 
@@ -31,14 +32,10 @@ instance (Add n1 n2 n,
       size = zeroExtend v1.size + zeroExtend v2.size;
       items =
         let options :: Vector (TAdd 1 n1) (Vector n a) =
-              genWith $ \ i ->
-                genWith $ \ j ->
-                  if j < i
-                  then v1.items !! j
-                  else if j < i + valueOf n2
-                  then v2.items !! (j - i)
-                  else _;
-        in select options v1.size;
+              genWith $ \ i -> arrayToVector $ Array.append
+                (Array.shrinkLeft (vectorToArray v1.items) i)
+                (Array.growRight (vectorToArray v2.items) i);
+        in select options $ toDynamicIndex v1.size;
     }
 
 class ConcatSizedVector n1 n2 n | n1 n2 -> n where
