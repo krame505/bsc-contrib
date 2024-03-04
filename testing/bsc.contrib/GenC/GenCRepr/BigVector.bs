@@ -1,0 +1,29 @@
+package BigVector where
+
+import GenCRepr
+import SizedVector
+import CShow
+import Vector
+
+
+type Size = 50
+
+{-# verilog sysBigVector #-}
+sysBigVector :: Module Empty
+sysBigVector = module
+  items :: Reg (Vector Size (Maybe (UInt 8))) <- mkWire
+  packed :: (GenCRepr (Vector Size (Maybe (UInt 8))) n) => Reg (SizedVector n (Bit 8)) <- mkWire
+
+  rules
+    when True ==>
+      items := Vector.concat $ Vector.replicate $
+        Just 1 :> Nothing :> Just 2 :> Nothing :> Nothing :>
+        Just 3 :> Just 4 :> Just 5 :> Nothing :> Just 6 :> Vector.nil
+
+    when True ==>
+      packed := packBytes items
+
+    when True ==> do
+      let result :: Vector Size (Maybe (UInt 8)) = unpackBytes packed.items
+      $display (cshow result)
+      $finish
