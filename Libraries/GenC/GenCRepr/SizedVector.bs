@@ -30,12 +30,10 @@ instance (Add n1 n2 n,
     append :: SizedVector n1 a -> SizedVector n2 a -> SizedVector n a
     append v1 v2 = SizedVector {
       size = zeroExtend v1.size + zeroExtend v2.size;
-      items =
-        let options :: Vector (TAdd 1 n1) (Vector n a) =
-              genWith $ \ i -> arrayToVector $ Array.append
-                (Array.shrinkLeft (vectorToArray v1.items) i)
-                (Array.growRight (vectorToArray v2.items) i);
-        in select options $ toDynamicIndex v1.size;
+      items = foldr
+        (\ (i, x) result -> update result ((zeroExtend v1.size + fromInteger i) :: UInt (SizeBits n)) x)
+        (Vector.append v1.items newVector)
+        (zip genVector v2.items);
     }
 
 class ConcatSizedVector n1 n2 n | n1 n2 -> n where
@@ -46,7 +44,7 @@ instance ConcatSizedVector 0 n 0 where
 
 instance (ConcatSizedVector n1' n2 n', Add n1' 1 n1, AppendSizedVector n' n2 n) =>
          ConcatSizedVector n1 n2 n where
-  concat v = append (head v) (concat $ tail v)
+  concat v = append (concat $ init v) $ last v
 
 extend :: (AppendSizedVector n k m) => SizedVector n a -> SizedVector m a
 extend v = SizedVector { size = zeroExtend v.size; items = Vector.append v.items $ replicate _; }
