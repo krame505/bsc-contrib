@@ -48,3 +48,11 @@ instance (ConcatSizedVector n1' n2 n', Add n1' 1 n1, AppendSizedVector n' n2 n) 
 
 extend :: (AppendSizedVector n k m) => SizedVector n a -> SizedVector m a
 extend v = SizedVector { size = zeroExtend v.size; items = Vector.append v.items $ replicate _; }
+
+accum :: (Add n k m) => Vector n a -> SizedVector m a -> SizedVector m a
+accum items v = SizedVector {
+  size = v.size + fromInteger (valueOf n);
+  items = foldr
+    (\ (i, x) result -> update result (v.size + fromInteger i) x)
+    v.items (zip genVector items);
+}

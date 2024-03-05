@@ -8,7 +8,7 @@ import State
 -- Class of types that can be represented and automatically packed/unpacked in C.
 -- n is the maximum number of bytes needed to pack a type.
 -- genC* methods in this class are parameterized by a proxy value to specify the type.
-class (UnpackBytes a n n) => GenCRepr a n | a -> n where
+class (PackedBytes a n n) => GenCRepr a n | a -> n where
   -- Compute a unique name for the type that is also a valid C identifier.
   typeName :: a -> String
 
@@ -21,9 +21,6 @@ class (UnpackBytes a n n) => GenCRepr a n | a -> n where
   -- or Nothing for primitive types.
   genCTypeDecl :: a -> Maybe String
   genCTypeDecl _ = Nothing
-
-  -- Pack a value of type a into a ByteList of at most n bytes.
-  packBytes :: a -> SizedVector n (Bit 8)
 
   -- Compute the C statement to pack a value of type a,
   -- given C expressions for the value and the result buffer.
@@ -43,9 +40,17 @@ class (UnpackBytes a n n) => GenCRepr a n | a -> n where
   genCUnpackDecl :: a -> Maybe (String, String)
   genCUnpackDecl _ = Nothing
 
-class UnpackBytes a n m | a m -> n where
+-- Functions for packing/unpacking values of type a, taking up at most n bytes in a vector of size m.
+class PackedBytes a n m | a m -> n where
+  -- Helper to pack a value into the end of a vector of bytes.
+  packBytesInto :: (Add n k m) => a -> PackBytes m
+
   -- Monadic implementation of unpackBytes.
   unpackBytesM :: (Add n k m) => ByteDecoder m a
+
+-- Pack a value of type a into a vector of bytes.
+packBytes :: (GenCRepr a n) => a -> SizedVector n (Bit 8)
+packBytes x = packBytesInto x SizedVector.nil
 
 -- Unpack bytes into a value of type a.
 unpackBytes :: (GenCRepr a n) => Vector n (Bit 8) -> a
@@ -58,6 +63,8 @@ pack x = bitsFromBytes (packBytes x).items
 -- Unpack a value from a Bit representation that is guaranteed to fit the type.
 unpack :: (GenCRepr a m, Mul m 8 n, Div n 8 m, Add p n (TMul m 8)) => Bit n -> a
 unpack = unpackBytes ∘ bitsToBytes
+
+type PackBytes n = SizedVector n (Bit 8) -> SizedVector n (Bit 8)
 
 struct ByteDecoder n a =
   run :: Vector n (Bit 8) -> UInt (SizeBits n) -> (a, UInt (SizeBits n))
@@ -138,25 +145,18 @@ genCIntUnpack numBytes val buf =
 -- Explcit instances for specific primitive types
 instance (PrimBytes (UInt b) n) => GenCRepr (UInt b) n where
   typeName _ = "uint" +++ integerToString (valueOf b)
-
   genCType _ = genCIntType False (valueOf n)
-
-  packBytes x = fromFullVector $ packPrim x
   genCPack _ = genCIntPack (valueOf n)
-
   genCUnpack _ = genCIntUnpack (valueOf n)
 
-instance (PrimBytes (UInt b) n) => UnpackBytes (UInt b) n m where
+instance (PrimBytes (UInt b) n) => PackedBytes (UInt b) n m where
+  packBytesInto x = accum $ packPrim x
   unpackBytesM = fmap unpackPrim consumeBytes
 
 instance (PrimBytes (Int b) n) => GenCRepr (Int b) n where
   typeName _ = "int" +++ integerToString (valueOf b)
-
   genCType _ = genCIntType True (valueOf n)
-
-  packBytes x = fromFullVector $ packPrim x
   genCPack _ = genCIntPack (valueOf n)
-
   genCUnpack _ val buf =
     genCIntUnpack (valueOf n) val buf +++
     case numCBytes (valueOf n) of
@@ -167,37 +167,35 @@ instance (PrimBytes (Int b) n) => GenCRepr (Int b) n where
           "\t// Signed type does not exactly fit a C integer type, pad with the sign bit\n" +++
           "\t" +++ val +++ " |= " +++ val +++ " >> " +++ integerToString (valueOf b - 1) +++ " == 0? 0 : -1 << " +++ integerToString (valueOf b) +++ ";"
 
-instance (PrimBytes (Int b) n) => UnpackBytes (Int b) n m where
+instance (PrimBytes (Int b) n) => PackedBytes (Int b) n m where
+  packBytesInto x = accum $ packPrim x
   unpackBytesM = fmap unpackPrim consumeBytes
 
 instance GenCRepr Bool 1 where
   typeName _ = "bool"
-
   genCType _ = ("_Bool", "")
-
-  packBytes x = fromFullVector $ zeroExtend (Prelude.pack x) :> Vector.nil
   genCPack _ = genCIntPack 1
-
   genCUnpack _ = genCIntUnpack 1
 
-instance UnpackBytes Bool 1 m where
+instance PackedBytes Bool 1 m where
+  packBytesInto x = accum $ zeroExtend (Prelude.pack x) :> Vector.nil
   unpackBytesM = fmap unpackPrim consumeBytes
 
 -- Default instance uses generics for arbitrary data types
-instance (Generic a r, GenCRepr' r n, UnpackBytes a n n) => GenCRepr a n where
+instance (Generic a r, GenCRepr' r n, PackedBytes a n n) => GenCRepr a n where
   typeName _ = typeName' (_ :: r)
 
   genCType _ = genCType' (_ :: r)
   genCTypeDecl _ = genCTypeDecl' (_ :: r)
 
-  packBytes x = packBytes' $ from x
   genCPack _ = genCPack' (_ :: r)
   genCPackDecl _ = genCPackDecl' (_ :: r)
 
   genCUnpack _ = genCUnpack' (_ :: r)
   genCUnpackDecl _ = genCUnpackDecl' (_ :: r)
 
-instance (Generic a r, UnpackBytes' r n m) => UnpackBytes a n m where
+instance (Generic a r, PackedBytes' r n m) => PackedBytes a n m where
+  packBytesInto x = packBytesInto' $ from x
   unpackBytesM = liftM to unpackBytesM'
 
 -- Generic version of GenCRepr has instances for Generic representation types
@@ -207,14 +205,14 @@ class GenCRepr' a n | a -> n where
   genCType' :: a -> (String, String)
   genCTypeDecl' :: a -> Maybe String
 
-  packBytes' :: a -> SizedVector n (Bit 8)
   genCPack' :: a -> String -> String -> String
   genCPackDecl' :: a -> Maybe (String, String)
 
   genCUnpack' :: a -> String -> String -> String
   genCUnpackDecl' :: a -> Maybe (String, String)
 
-class UnpackBytes' a n m | a m -> n where
+class PackedBytes' a n m | a m -> n where
+  packBytesInto' :: (Add n k m) => a -> PackBytes m
   unpackBytesM' :: (Add n k m) => ByteDecoder m a
 
 -- Primitive types with Bits instances are represented like unsigned integers
@@ -225,14 +223,14 @@ instance (PrimBytes a n) => GenCRepr' (ConcPrim a) n where
   genCType' _ = genCIntType False (valueOf n)
   genCTypeDecl' _ = Nothing
 
-  packBytes' (ConcPrim x) = fromFullVector $ packPrim x
   genCPack' _ = genCIntPack (valueOf n)
   genCPackDecl' _ = Nothing
 
   genCUnpack' _ = genCIntUnpack (valueOf n)
   genCUnpackDecl' _ = Nothing
 
-instance (PrimBytes a n) => UnpackBytes' (ConcPrim a) n m where
+instance (PrimBytes a n) => PackedBytes' (ConcPrim a) n m where
+  packBytesInto' (ConcPrim x) = accum $ packPrim x
   unpackBytesM' = fmap (ConcPrim ∘ unpackPrim) consumeBytes
 
 -- Single constructor corresponds to flat struct
@@ -246,7 +244,6 @@ instance (GenCStructBody bodyRepr n, TypeNames ta) =>
     "} " +++ typeName' p +++ ";\n" +++
     "enum { size_" +++ typeName' p +++ " = " +++ integerToString (valueOf n) +++ " };"
 
-  packBytes' (Meta (Meta y)) = packStructBody y
 
   genCPack' p val buf = "pack_" +++ typeName' p +++ "(" +++ val +++ ", " +++ buf +++ ");"
 
@@ -266,8 +263,9 @@ instance (GenCStructBody bodyRepr n, TypeNames ta) =>
     "\treturn val;\n" +++
     "}")
 
-instance (UnpackStructBody bodyRepr n m) =>
-         UnpackBytes' (Meta (MetaData name pkg ta 1) (Meta (MetaConsNamed cName cIdx numFields) bodyRepr)) n m where
+instance (PackedStructBody bodyRepr n m) =>
+         PackedBytes' (Meta (MetaData name pkg ta 1) (Meta (MetaConsNamed cName cIdx numFields) bodyRepr)) n m where
+  packBytesInto' (Meta (Meta y)) = packStructBody y
   unpackBytesM' = liftM Meta $ liftM Meta unpackStructBody
 
 -- Single-constructor data case, same as above
@@ -281,7 +279,6 @@ instance (GenCStructBody bodyRepr n, TypeNames ta) =>
     "} " +++ typeName' p +++ ";\n" +++
     "enum { size_" +++ typeName' p +++ " = " +++ integerToString (valueOf n) +++ " };"
 
-  packBytes' (Meta (Meta y)) = packStructBody y
 
   genCPack' p val buf = "pack_" +++ typeName' p +++ "(" +++ val +++ ", " +++ buf +++ ");"
 
@@ -301,8 +298,9 @@ instance (GenCStructBody bodyRepr n, TypeNames ta) =>
     "\treturn val;\n" +++
     "}")
 
-instance (UnpackStructBody bodyRepr n m) =>
-         UnpackBytes' (Meta (MetaData name pkg ta 1) (Meta (MetaConsAnon cName cIdx numFields) bodyRepr)) n m where
+instance (PackedStructBody bodyRepr n m) =>
+         PackedBytes' (Meta (MetaData name pkg ta 1) (Meta (MetaConsAnon cName cIdx numFields) bodyRepr)) n m where
+  packBytesInto' (Meta (Meta y)) = packStructBody y
   unpackBytesM' = liftM Meta $ liftM Meta unpackStructBody
 
 -- Multi-constructor case, generate a tagged union
@@ -325,8 +323,6 @@ instance (GenCUnionBody tagBytes bodyRepr maxCIdx n, TypeNames ta,
     "} " +++ typeName' p +++ ";\n" +++
     "enum { size_" +++ typeName' p +++ " = " +++ integerToString (valueOf n) +++ " };"
 
-  packBytes' (Meta y) = packUnionBody (_ :: Bit tagBytes) y
-
   genCPack' p val buf = "pack_" +++ typeName' p +++ "(" +++ val +++ ", " +++ buf +++ ");"
 
   genCPackDecl' p = Just (
@@ -347,12 +343,13 @@ instance (GenCUnionBody tagBytes bodyRepr maxCIdx n, TypeNames ta,
     "\treturn val;\n" +++
     "}")
 
-instance (UnpackUnionBody tagBytes bodyRepr maxCIdx n m, Log numCtors tagBits, Div tagBits 8 tagBytes) =>
-         UnpackBytes' (Meta (MetaData name pkg ta numCtors) bodyRepr) n m where
+instance (PackedUnionBody tagBytes bodyRepr maxCIdx n m, Log numCtors tagBits, Div tagBits 8 tagBytes) =>
+         PackedBytes' (Meta (MetaData name pkg ta numCtors) bodyRepr) n m where
+  packBytesInto' (Meta y) = packUnionBody (_ :: Bit tagBytes) y
   unpackBytesM' = liftM Meta $ unpackUnionBody (_ :: Bit tagBytes)
 
 -- Collections (ListN and Vector) are represented as arrays
-instance (GenCRepr a elemBytes, ConcatSizedVector numElems elemBytes n) =>
+instance (GenCRepr a elemBytes, Mul numElems elemBytes n) =>
          GenCRepr' (Meta (MetaData name pkg ta 1) (Vector numElems (Conc a))) n where
   typeName' _ = integerToString (valueOf numElems) +++ "_" +++ typeName (_ :: a) +++ "s"
 
@@ -360,8 +357,6 @@ instance (GenCRepr a elemBytes, ConcatSizedVector numElems elemBytes n) =>
     let (lType, rType) = genCType (_ :: a)
     in (lType, "[" +++ integerToString (valueOf numElems) +++ "]" +++ rType)
   genCTypeDecl' _ = Nothing
-
-  packBytes' (Meta x) = concat $ map (\ (Conc a) -> packBytes a) x
 
   genCPack' _ val buf = foldr (\ p1 p2 -> p1 +++ " " +++ p2) "" $ map
     (\ i -> genCPack (_ :: a) (val +++ "[" +++ integerToString i +++ "]") buf)
@@ -373,8 +368,9 @@ instance (GenCRepr a elemBytes, ConcatSizedVector numElems elemBytes n) =>
     (genList :: Vector numElems Integer)
   genCUnpackDecl' _ = Nothing
 
-instance (UnpackBytes a elemBytes m, Mul numElems elemBytes n, Add elemBytes k m) =>
-         UnpackBytes' (Meta (MetaData name pkg ta 1) (Vector numElems (Conc a))) n m where
+instance (PackedBytes a elemBytes m, Mul numElems elemBytes n, Add elemBytes k m) =>
+         PackedBytes' (Meta (MetaData name pkg ta 1) (Vector numElems (Conc a))) n m where
+  packBytesInto' (Meta x) b = foldl (flip $ \ (Conc a) -> packBytesInto a) b x
   unpackBytesM' = liftM (Meta ∘ map Conc) $ replicateM unpackBytesM
 
 -- Helper to compute the portion of a type name from a tuple of type arguments.
@@ -414,19 +410,16 @@ class GenCUnionBody nt a i n | nt a -> i n where
   genCUnionBody :: Bit nt -> a -> String -> String
   hasUnionMembers :: Bit nt -> a -> Bool
 
-  packUnionBody :: Bit nt -> a -> SizedVector n (Bit 8)
   genCPackUnionBody :: Bit nt -> a -> String -> String
-
   genCUnpackUnionBody :: Bit nt -> a -> String -> String
 
-class UnpackUnionBody nt a i n m | nt a m -> i n where
+class PackedUnionBody nt a i n m | nt a m -> i n where
+  packUnionBody :: Bit nt -> a -> PackBytes m
   unpackUnionBody :: (Add n k m) => Bit nt -> ByteDecoder m a
 
 -- "sum" case, need to compare the tag with the index in unpacking
 instance (GenCUnionBody tagBytes a i1 n1, GenCUnionBody tagBytes b i2 n2,
-          Max n1 n2 n,
-          AppendSizedVector n1 p1 n,
-          AppendSizedVector n2 p2 n) =>
+          Max n1 n2 n, Add n1 p1 n, Add n2 p2 n) =>
          GenCUnionBody tagBytes (Either a b) i2 n where
   genCEnumBody _ _ typeName =
     genCEnumBody (_ :: Bit tagBytes) (_ :: a) typeName +++ ", " +++
@@ -437,9 +430,6 @@ instance (GenCUnionBody tagBytes a i1 n1, GenCUnionBody tagBytes b i2 n2,
   hasUnionMembers _ _ =
     hasUnionMembers (_ :: Bit tagBytes) (_ :: a) ||
     hasUnionMembers (_ :: Bit tagBytes) (_ :: b)
-
-  packUnionBody _ (Left x) = extend $ packUnionBody (_ :: Bit tagBytes) x
-  packUnionBody _ (Right x) = extend $ packUnionBody (_ :: Bit tagBytes) x
   genCPackUnionBody _ _ typeName =
     genCPackUnionBody (_ :: Bit tagBytes) (_ :: a) typeName +++
     genCPackUnionBody (_ :: Bit tagBytes) (_ :: b) typeName
@@ -448,10 +438,11 @@ instance (GenCUnionBody tagBytes a i1 n1, GenCUnionBody tagBytes b i2 n2,
     genCUnpackUnionBody (_ :: Bit tagBytes) (_ :: a) typeName +++
     genCUnpackUnionBody (_ :: Bit tagBytes) (_ :: b) typeName
 
-instance (UnpackUnionBody tagBytes a i1 n1 m, UnpackUnionBody tagBytes b i2 n2 m,
-          Max n1 n2 n,
-          Add tagBytes k m, Add n1 k1 m, Add n2 k2 m) =>
-         UnpackUnionBody tagBytes (Either a b) i2 n m where
+instance (PackedUnionBody tagBytes a i1 n1 m, PackedUnionBody tagBytes b i2 n2 m,
+          Max n1 n2 n, Add tagBytes k m, Add n1 k1 m, Add n2 k2 m) =>
+         PackedUnionBody tagBytes (Either a b) i2 n m where
+  packUnionBody _ (Left x) = packUnionBody (_ :: Bit tagBytes) x
+  packUnionBody _ (Right x) = packUnionBody (_ :: Bit tagBytes) x
   unpackUnionBody _ = do
     x :: Vector tagBytes (Bit 8) <- peekBytes
     if Prelude.pack x <= fromInteger (valueOf i1)
@@ -465,20 +456,20 @@ instance (Mul tagBytes 8 tagBits) =>
   genCUnionBody _ _ _ = ""
   hasUnionMembers _ _ = False
 
-  packUnionBody _ (Meta ()) =
-    let tag :: (UInt tagBits) = fromInteger $ valueOf ctorIdx
-    in fromFullVector $ Prelude.unpack $ Prelude.pack tag
   genCPackUnionBody _ _ _ = ""
-
   genCUnpackUnionBody _ _ _ = ""
 
-instance UnpackUnionBody tagBytes (Meta (MetaConsAnon ctorName ctorIdx 0) ()) ctorIdx tagBytes m where
+instance (Add tagBytes k m) =>
+         PackedUnionBody tagBytes (Meta (MetaConsAnon ctorName ctorIdx 0) ()) ctorIdx tagBytes m where
+  packUnionBody _ (Meta ()) =
+    let tag :: (UInt tagBits) = fromInteger $ valueOf ctorIdx
+    in accum ((Prelude.unpack $ Prelude.pack tag) :: Vector tagBytes (Bit 8))
   unpackUnionBody _ = do
     consumeBytes :: ByteDecoder m (Vector tagBytes (Bit 8))
     return $ Meta ()
 
 -- Special case for a constructor with a single anonymous field, don't create an inner struct
-instance (GenCRepr a n', Mul tagBytes 8 tagBits, AppendSizedVector tagBytes n' n) =>
+instance (GenCRepr a n', Mul tagBytes 8 tagBits, Add tagBytes n' n) =>
          GenCUnionBody
            tagBytes (Meta (MetaConsAnon ctorName ctorIdx 1) (Meta (MetaField fieldName fieldIdx) (Conc a)))
            ctorIdx n where
@@ -488,9 +479,6 @@ instance (GenCRepr a n', Mul tagBytes 8 tagBits, AppendSizedVector tagBytes n' n
     in "\t\t" +++ lType +++ " " +++ stringOf ctorName +++ rType +++ ";\n"
   hasUnionMembers _ _ = True
 
-  packUnionBody _ (Meta (Meta (Conc x))) =
-    let tag :: (UInt tagBits) = fromInteger $ valueOf ctorIdx
-    in append (fromFullVector $ Prelude.unpack $ Prelude.pack tag) $ packBytes x
   genCPackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     "\t\t" +++ genCPack (_ :: a) ("val.contents." +++ stringOf ctorName) "buf" +++ "\n" +++
@@ -501,16 +489,19 @@ instance (GenCRepr a n', Mul tagBytes 8 tagBits, AppendSizedVector tagBytes n' n
     "\t\t" +++ genCUnpack (_ :: a) ("val.contents." +++ stringOf ctorName) "buf" +++ "\n" +++
     "\t} else "
 
-instance (UnpackBytes a n' m, Add tagBytes n' n, Add tagBytes k1 m, Add n' k2 m) =>
-         UnpackUnionBody
+instance (PackedBytes a n' m, Add tagBytes n' n, Add tagBytes k1 m, Add n' k2 m) =>
+         PackedUnionBody
            tagBytes (Meta (MetaConsAnon ctorName ctorIdx 1) (Meta (MetaField fieldName fieldIdx) (Conc a)))
            ctorIdx n m where
+  packUnionBody _ (Meta (Meta (Conc x))) =
+    let tag :: (UInt tagBits) = fromInteger $ valueOf ctorIdx
+    in packBytesInto x ∘ accum ((Prelude.unpack $ Prelude.pack tag) :: Vector tagBytes (Bit 8))
   unpackUnionBody _ = do
     consumeBytes :: ByteDecoder m (Vector tagBytes (Bit 8))
     liftM Meta $ liftM Meta $ liftM Conc unpackBytesM
 
 -- Instance for multiple named fields, represented by an inner struct
-instance (GenCStructBody bodyRepr n', Mul tagBytes 8 tagBits, AppendSizedVector tagBytes n' n) =>
+instance (GenCStructBody bodyRepr n', Mul tagBytes 8 tagBits, Add tagBytes n' n) =>
          GenCUnionBody tagBytes (Meta (MetaConsNamed ctorName ctorIdx numFields) bodyRepr) ctorIdx n where
   genCEnumBody _ _ typeName = typeName +++ "_" +++ stringOf ctorName
   genCUnionBody _ _ typeName =
@@ -519,9 +510,6 @@ instance (GenCStructBody bodyRepr n', Mul tagBytes 8 tagBits, AppendSizedVector 
     "\t\t} " +++ stringOf ctorName +++ ";\n"
   hasUnionMembers _ _ = True
 
-  packUnionBody _ (Meta x) =
-    let tag :: (UInt tagBits) = fromInteger $ valueOf ctorIdx
-    in append (fromFullVector $ Prelude.unpack $ Prelude.pack tag) $ packStructBody x
   genCPackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCPackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
@@ -532,14 +520,17 @@ instance (GenCStructBody bodyRepr n', Mul tagBytes 8 tagBits, AppendSizedVector 
     genCUnpackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
     "\t} else "
 
-instance (UnpackStructBody bodyRepr n' m, Add tagBytes n' n, Add tagBytes k1 m, Add n' k2 m) =>
-         UnpackUnionBody tagBytes (Meta (MetaConsNamed ctorName ctorIdx numFields) bodyRepr) ctorIdx n m where
+instance (PackedStructBody bodyRepr n' m, Add tagBytes n' n, Add tagBytes k1 m, Add n' k2 m) =>
+         PackedUnionBody tagBytes (Meta (MetaConsNamed ctorName ctorIdx numFields) bodyRepr) ctorIdx n m where
+  packUnionBody _ (Meta x) =
+    let tag :: (UInt tagBits) = fromInteger $ valueOf ctorIdx
+    in packStructBody x ∘ accum ((Prelude.unpack $ Prelude.pack tag) :: Vector tagBytes (Bit 8))
   unpackUnionBody _ = do
     consumeBytes :: ByteDecoder m (Vector tagBytes (Bit 8))
     liftM Meta unpackStructBody
 
 -- Instance for multiple anonymous fields, same as above
-instance (GenCStructBody bodyRepr n', Mul tagBytes 8 tagBits, AppendSizedVector tagBytes n' n) =>
+instance (GenCStructBody bodyRepr n', Mul tagBytes 8 tagBits, Add tagBytes n' n) =>
          GenCUnionBody tagBytes (Meta (MetaConsAnon ctorName ctorIdx numFields) bodyRepr) ctorIdx n where
   genCEnumBody _ _ typeName = typeName +++ "_" +++ stringOf ctorName
   genCUnionBody _ _ typeName =
@@ -547,10 +538,6 @@ instance (GenCStructBody bodyRepr n', Mul tagBytes 8 tagBits, AppendSizedVector 
     genCStructBody (_ :: bodyRepr) True +++
     "\t\t} " +++ stringOf ctorName +++ ";\n"
   hasUnionMembers _ _ = True
-
-  packUnionBody _ (Meta x) =
-    let tag :: (UInt tagBits) = fromInteger $ valueOf ctorIdx
-    in append (fromFullVector $ Prelude.unpack $ Prelude.pack tag) $ packStructBody x
   genCPackUnionBody _ _ typeName =
     "if (val.tag == " +++ typeName +++ "_" +++ stringOf ctorName +++ ") {\n" +++
     genCPackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
@@ -561,8 +548,11 @@ instance (GenCStructBody bodyRepr n', Mul tagBytes 8 tagBits, AppendSizedVector 
     genCUnpackStructBody (_ :: bodyRepr) True (".contents." +++ stringOf ctorName) +++ "\n" +++
     "\t} else "
 
-instance (UnpackStructBody bodyRepr n' m, Add tagBytes n' n, Add tagBytes k1 m, Add n' k2 m) =>
-         UnpackUnionBody tagBytes (Meta (MetaConsAnon ctorName ctorIdx numFields) bodyRepr) ctorIdx n m where
+instance (PackedStructBody bodyRepr n' m, Add tagBytes n' n, Add tagBytes k1 m, Add n' k2 m) =>
+         PackedUnionBody tagBytes (Meta (MetaConsAnon ctorName ctorIdx numFields) bodyRepr) ctorIdx n m where
+  packUnionBody _ (Meta x) =
+    let tag :: (UInt tagBits) = fromInteger $ valueOf ctorIdx
+    in packStructBody x ∘ accum ((Prelude.unpack $ Prelude.pack tag) :: Vector tagBytes (Bit 8))
   unpackUnionBody _ = do
     consumeBytes :: ByteDecoder m (Vector tagBytes (Bit 8))
     liftM Meta unpackStructBody
@@ -573,38 +563,38 @@ instance (UnpackStructBody bodyRepr n' m, Add tagBytes n' n, Add tagBytes k1 m, 
 -- Code generation methods require proxy values for nt and a.
 class GenCStructBody a n | a -> n where
   genCStructBody :: a -> Bool -> String
-  packStructBody :: a -> SizedVector n (Bit 8)
   genCPackStructBody :: a -> Bool -> String -> String
   genCUnpackStructBody :: a -> Bool -> String -> String
 
-class UnpackStructBody a n m | a m -> n where
+class PackedStructBody a n m | a m -> n where
+  packStructBody :: a -> PackBytes m
   unpackStructBody :: (Add n k m) => ByteDecoder m a
 
 -- "product" case
-instance (GenCStructBody a n1, GenCStructBody b n2, AppendSizedVector n1 n2 n) =>
+instance (GenCStructBody a n1, GenCStructBody b n2, Add n1 n2 n) =>
          GenCStructBody (a, b) n where
   genCStructBody _ nested =
     genCStructBody (_ :: a) nested +++ genCStructBody (_ :: b) nested
 
-  packStructBody (x, y) = packStructBody x `append` packStructBody y
   genCPackStructBody _ nested sel =
     genCPackStructBody (_ :: a) nested sel +++ "\n" +++ genCPackStructBody (_ :: b) nested sel
 
   genCUnpackStructBody _ nested sel =
     genCUnpackStructBody (_ :: a) nested sel +++ "\n" +++ genCUnpackStructBody (_ :: b) nested sel
 
-instance (UnpackStructBody a n1 m, UnpackStructBody b n2 m, Add n1 n2 n, Add n1 k1 m, Add n2 k2 m) =>
-         UnpackStructBody (a, b) n m where
+instance (PackedStructBody a n1 m, PackedStructBody b n2 m, Add n1 n2 n, Add n1 k1 m, Add n2 k2 m) =>
+         PackedStructBody (a, b) n m where
+  packStructBody (x, y) = packStructBody y ∘ packStructBody x
   unpackStructBody = liftM2 tuple2 unpackStructBody unpackStructBody
 
 -- empty case
 instance GenCStructBody () 0 where
   genCStructBody _ _ = ""
-  packStructBody () = nil
   genCPackStructBody _ _ _ = ""
   genCUnpackStructBody _ _ _ = ""
 
-instance UnpackStructBody () 0 m where
+instance PackedStructBody () 0 m where
+  packStructBody () = id
   unpackStructBody = return ()
 
 -- Instance for a single concrete field, calls back to non-generic GenCRepr methods
@@ -613,7 +603,6 @@ instance (GenCRepr a n) => GenCStructBody (Meta (MetaField name idx) (Conc a)) n
     let (lType, rType) = genCType (_ :: a)
     in (if nested then "\t\t" else "") +++ "\t" +++ lType +++ " " +++ stringOf name +++ rType +++ ";\n"
 
-  packStructBody (Meta (Conc x)) = packBytes x
   genCPackStructBody _ nested sel =
     (if nested then "\t" else "") +++
     "\t" +++ genCPack (_ :: a) ("val" +++ sel +++ "." +++ stringOf name) "buf"
@@ -622,7 +611,8 @@ instance (GenCRepr a n) => GenCStructBody (Meta (MetaField name idx) (Conc a)) n
     (if nested then "\t" else "") +++
     "\t" +++ genCUnpack (_ :: a) ("val" +++ sel +++ "." +++ stringOf name) "buf"
 
-instance (UnpackBytes a n m, Add n k m) => UnpackStructBody (Meta (MetaField name idx) (Conc a)) n m where
+instance (PackedBytes a n m, Add n k m) => PackedStructBody (Meta (MetaField name idx) (Conc a)) n m where
+  packStructBody (Meta (Conc x)) = packBytesInto x
   unpackStructBody = liftM Meta $ liftM Conc unpackBytesM
 
 
