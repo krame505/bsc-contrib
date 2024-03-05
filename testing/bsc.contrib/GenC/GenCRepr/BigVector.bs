@@ -5,8 +5,12 @@ import SizedVector
 import CShow
 import Vector
 
+-- Pathological case: a vector of variable-sized elements.
+-- Each element can affect the index of all subsequent elements.
+-- We want to make sure we avoid enumerating all these cases, which could
+-- yield a quadradic (or even exponential) blowup at elaboration time.
 
-type Size = 50
+type Size = 100
 
 {-# verilog sysBigVector #-}
 sysBigVector :: Module Empty
@@ -24,6 +28,7 @@ sysBigVector = module
       packed := packBytes items
 
     when True ==> do
+      $display (cshow packed.items)
       let result :: Vector Size (Maybe (UInt 8)) = unpackBytes packed.items
       $display (cshow result)
       $finish
